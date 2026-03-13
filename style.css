@@ -1,0 +1,7 @@
+.btn-card.active {
+    background: #FF5722 !important;
+    border-color: #E64A19 !important;
+    box-shadow: 0 0 12px rgba(255, 87, 34, 0.8) !important;
+    transform: scale(0.95);
+    color: white;
+}

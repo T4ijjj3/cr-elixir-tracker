@@ -1,0 +1,21 @@
+{
+  "name": "CR Elixir Tracker",
+  "short_name": "ElixirTrack",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#202020",
+  "theme_color": "#202020",
+  "description": "Clash Royale Elixir Voice Tracker",
+  "icons": [
+    {
+      "src": "images/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "images/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+  body { background: #111; padding: 50px; }
+  .slot {
+    width: 90px;
+    height: 60px;
+    background: #333;
+    position: relative;
+    overflow: hidden;
+    display: inline-block;
+    border-radius: 6px;
+    margin: 10px;
+  }
+  .slot-art {
+    position: absolute;
+    width: 150%;
+    height: auto;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -45%);
+    opacity: 0.8;
+  }
+  .slot2 .slot-art { transform: translate(-50%, -35%); width: 140%; }
+  .slot3 .slot-art { transform: translate(-50%, -50%); width: 160%; }
+  
+  .cost { position: absolute; z-index: 2; top: 5px; left: 5px; color: white; font-weight: bold; }
+</style>
+</head>
+<body>
+  <div class="slot"><img class="slot-art" src="file:///home/t4i/CartasClashRoyale/Mineiro.png"><div class="cost">3</div></div>
+  <div class="slot slot2"><img class="slot-art" src="file:///home/t4i/CartasClashRoyale/Valquíria.png"><div class="cost">4</div></div>
+  <div class="slot slot3"><img class="slot-art" src="file:///home/t4i/CartasClashRoyale/O%20Tronco.png"><div class="cost">2</div></div>
+</body>
+</html>

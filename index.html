@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+
+<head>
+    <link rel="manifest" href="manifest.json">
+    <meta name="theme-color" content="#202020">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="theme-color" content="#120d26">
+    <meta name="mobile-web-app-capable" content="yes">
+    <link rel="manifest" href="manifest.json">
+    <title>CR Elixir Tracker</title>
+    <meta name="description" content="Rastreador de elixir do oponente — Clash Royale">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style_v2.css?v=35">
+</head>
+
+<body>
+    <div id="version" style="position:fixed;top:0;right:0;background:red;color:white;z-index:9999;font-size:12px;padding:2px;">v35</div>
+    <div id="version" style="position:fixed;top:0;right:0;background:red;color:white;z-index:9999;font-size:12px;padding:2px;">v31</div>
+    <div class="desktop-layout">
+
+        <!-- ===== LEFT COLUMN: Core tracker ===== -->
+        <main class="col-main">
+
+            <!-- Next Card Hero -->
+            <section class="next-card-hero" id="nextCardHero">
+                <div class="next-card-label">⚡ PRÓXIMA CARTA A VOLTAR</div>
+                <div class="next-card-display" id="nextCardDisplay">
+                    <span class="next-card-empty">Jogue cartas para rastrear</span>
+                </div>
+            </section>
+
+            <!-- Timer + Elixir -->
+            <section class="status-row">
+                <div class="timer-block">
+                    <div class="timer-compact" id="timerDisplay">3:00</div>
+                    <div class="match-phase" id="matchPhase">PRONTO</div>
+                </div>
+                <div class="elixir-block">
+                    <div class="elixir-value" id="elixirValue">7</div>
+                    <div class="elixir-bar-wrapper">
+                        <div class="elixir-bar-bg">
+                            <div class="elixir-bar-fill" id="elixirBarFill" style="width: 70%;"></div>
+                        </div>
+                    </div>
+                    <div class="elixir-meta">
+                        <span id="regenRate">2.8s</span>
+                        <span class="elixir-wasted">🗑️ <span id="wastedValue">0.0</span></span>
+                    </div>
+                </div>
+            </section>
+
+            <div class="timer-bar-container">
+                <div class="timer-bar" id="timerBar"></div>
+                <div class="timer-phase-marker" style="left: 66.66%;" title="2x Elixir"></div>
+            </div>
+
+            <!-- Card Cost Buttons -->
+            <section class="cards-section">
+                <div class="card-buttons" id="cardButtons">
+                    <button class="card-btn" data-cost="1">1</button>
+                    <button class="card-btn" data-cost="2">2</button>
+                    <button class="card-btn" data-cost="3">3</button>
+                    <button class="card-btn" data-cost="4">4</button>
+                    <button class="card-btn" data-cost="5">5</button>
+                    <button class="card-btn" data-cost="6">6</button>
+                    <button class="card-btn" data-cost="7">7</button>
+                    <button class="card-btn" data-cost="8">8</button>
+                    <button class="card-btn" data-cost="9">9</button>
+                    <button class="card-btn card-btn-ten" data-cost="10">10</button>
+                </div>
+            </section>
+
+            <!-- Controls -->
+            <section class="controls-section">
+                <button class="btn-reset-elixir" id="btnResetElixir">
+                    🔄 Reset 10 <kbd>Q</kbd>
+                </button>
+                <button class="btn-start" id="btnStart">
+                    <span class="btn-icon">▶</span> INICIAR
+                </button>
+                <button class="btn-voice" id="btnVoice" title="Ativar voz">
+                    <span class="btn-icon">🎤</span> VOZ
+                </button>
+            </section>
+
+            <section class="voice-status" id="voiceStatus" style="display:none;">
+                <div class="voice-status-head">
+                    <span class="voice-dot" id="voiceDot"></span>
+                    <span class="voice-status-text" id="voiceStatusText">Voz inativa</span>
+                </div>
+                <div class="voice-transcript" id="voiceTranscript"></div>
+            </section>
+
+            <!-- Cycle -->
+            <section class="cycle-section">
+                <div class="cycle-header">
+                    <h3>🔄 Ciclo</h3>
+                    <span class="cycle-stat">Jogadas: <strong id="cardsPlayed">0</strong></span>
+                </div>
+                <div class="cycle-grid">
+                    <div class="cycle-row">
+                        <span class="cycle-label">Mão</span>
+                        <div class="cycle-cards" id="cycleHand">
+                            <div class="cycle-card unknown">?</div>
+                            <div class="cycle-card unknown">?</div>
+                            <div class="cycle-card unknown">?</div>
+                            <div class="cycle-card unknown">?</div>
+                        </div>
+                    </div>
+                    <div class="cycle-row">
+                        <span class="cycle-label">Fila</span>
+                        <div class="cycle-cards" id="cycleQueue">
+                            <span class="cycle-empty">—</span>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </main>
+
+        <!-- ===== RIGHT COLUMN: Intel panel ===== -->
+        <aside class="col-side">
+
+            <!-- Identification Panel (inline, non-blocking) -->
+            <section class="identify-panel" id="identifyOverlay" style="display:none;">
+                <div class="identify-header">
+                    <h3>🔍 Carta de <span id="identifyCost">?</span> elixir</h3>
+                    <button class="identify-close" id="identifyClose">✕</button>
+                </div>
+                <div class="identify-step" id="identifyStepType">
+                    <div class="identify-type-buttons">
+                        <button class="type-btn" data-type="troop" id="typeTroop"><kbd>Z</kbd> Tropa</button>
+                        <button class="type-btn type-spell" data-type="spell" id="typeSpell"><kbd>X</kbd>
+                            Feitiço</button>
+                        <button class="type-btn type-building" data-type="building" id="typeBuilding"><kbd>C</kbd>
+                            Construção</button>
+                        <button class="type-btn type-hero" data-type="hero" id="typeHero"><kbd>V</kbd> Herói</button>
+                    </div>
+                </div>
+                <div class="identify-step" id="identifyStepCard" style="display:none;">
+                    <p class="identify-hint">Letra para selecionar · <kbd>/</kbd> pular · <kbd>Backspace</kbd> voltar
+                    </p>
+                    <div class="identify-card-list" id="identifyCardList"></div>
+                </div>
+            </section>
+
+            <!-- Deck do Oponente -->
+            <section class="deck-section" id="deckSection">
+                <div class="deck-header">
+                    <h3>🃏 Deck do Oponente</h3>
+                    <span class="deck-counter"><span id="deckCount">0</span>/8</span>
+                </div>
+                <div class="deck-cards" id="deckCards">
+                    <div class="deck-slot empty">?</div>
+                    <div class="deck-slot empty">?</div>
+                    <div class="deck-slot empty">?</div>
+                    <div class="deck-slot empty">?</div>
+                    <div class="deck-slot empty">?</div>
+                    <div class="deck-slot empty">?</div>
+                    <div class="deck-slot empty">?</div>
+                    <div class="deck-slot empty">?</div>
+                </div>
+            </section>
+
+            <!-- Predicted Deck -->
+            <section class="predicted-section">
+                <h3>🎯 Deck Provável</h3>
+                <div id="predictedDeck" class="predicted-list">
+                    <span class="predicted-empty">Identifique cartas para prever o deck</span>
+                </div>
+            </section>
+
+            <!-- History -->
+            <section class="history-section">
+                <h3 class="history-title">📋 Histórico</h3>
+                <div class="history-list" id="historyList">
+                    <div class="history-empty">Nenhuma jogada registrada</div>
+                </div>
+            </section>
+        </aside>
+    </div>
+
+    <!-- identification panel is now inline in col-side -->
+
+    <!-- Shortcuts -->
+    <footer class="shortcuts-bar">
+        <div class="shortcut"><kbd>1</kbd>–<kbd>9</kbd> Custo</div>
+        <div class="shortcut"><kbd>0</kbd> = 10</div>
+        <div class="shortcut"><kbd>R</kbd> Descartar Sugestões</div>
+        <div class="shortcut"><kbd>Q</kbd> Reset</div>
+        <div class="shortcut"><kbd>Espaço</kbd> Start</div>
+        <div class="shortcut"><kbd>🎤</kbd> Voz</div>
+    </footer>
+
+    <script src="cards_db.js?v=4"></script>
+    <script src="app_v2.js?v=32"></script>
+    <script>
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.register('sw.js').then(() => console.log('Service Worker Registrado!'));
+        }
+    </script>
+    <script src="install-sw.js"></script>
+</body>
+
+</html>
