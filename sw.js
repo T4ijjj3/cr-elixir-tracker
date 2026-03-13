@@ -1,8 +1,8 @@
 const CACHE_NAME = 'cr-elixir-v1';
 const ASSETS = [
   './index.html',
-  './style_v2.css?v=35',
-  './app_v2.js?v=35',
+  './style_v2.css?v=36',
+  './app_v2.js?v=36',
   './manifest.json'
 ];
 

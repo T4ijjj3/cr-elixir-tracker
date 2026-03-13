@@ -1,0 +1,101 @@
+
+    if (!parsed.cost) {
+        updateVoiceUI('error', 'Fale um custo entre 1 e 10.');
+        return;
+    }
+
+    handleVoicePlay(parsed.cost, parsed.cardText);
+}
+
+function initVoiceRecognition() {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    state.voice.supported = Boolean(SpeechRecognition);
+
+    if (!state.voice.supported) {
+        if (els.btnVoice) {
+            els.btnVoice.disabled = true;
+            els.btnVoice.title = 'Seu navegador nao suporta reconhecimento de voz';
+        }
+        updateVoiceUI('error', 'Reconhecimento de voz indisponivel neste navegador.');
+        return;
+    }
+
+    const recognition = new SpeechRecognition();
+    recognition.lang = 'pt-BR';
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.maxAlternatives = 3;
+
+    recognition.onstart = () => {
+        state.voice.listening = true;
+        updateVoiceUI('listening', 'Ouvindo comandos...');
+    };
+
+    recognition.onresult = (event) => {
+        let interim = '';
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+            const transcript = event.results[i][0].transcript.trim();
+            if (!transcript) continue;
+            if (event.results[i].isFinal) {
+                processVoiceTranscript(transcript);
+            } else {
+                interim += transcript + ' ';
+            }
+        }
+
+        if (interim.trim()) {
+            updateVoiceUI('listening', 'Ouvindo comandos...', interim.trim());
+        }
+    };
+
+    recognition.onerror = (event) => {
+        if (event.error === 'aborted' && state.voice.manuallyStopped) return;
+        updateVoiceUI('error', `Erro de voz: ${event.error}`);
+    };
+
+    recognition.onend = () => {
+        state.voice.listening = false;
+        if (!state.voice.manuallyStopped) {
+            try {
+                recognition.start();
+            } catch (_) {
+                updateVoiceUI('error', 'Falha ao reiniciar reconhecimento de voz.');
+            }
+        } else {
+            updateVoiceUI('idle', 'Voz inativa');
+        }
+    };
+
+    state.voice.recognition = recognition;
+    updateVoiceUI('idle', 'Voz pronta. Clique em VOZ para iniciar.');
+}
+
+function toggleVoiceListening() {
+    if (!state.voice.supported || !state.voice.recognition) return;
+
+    if (state.voice.listening) {
+        state.voice.manuallyStopped = true;
+        state.voice.recognition.stop();
+        return;
+    }
+
+    state.voice.manuallyStopped = false;
+    try {
+        state.voice.recognition.start();
+    } catch (_) {
+        updateVoiceUI('error', 'Nao foi possivel iniciar o microfone.');
+    }
+}
+
+// ─── Events ──────────────────────────────────────────────
+
+els.cardButtons.addEventListener('click', e => {
+    const btn = e.target.closest('.card-btn');
+    if (!btn) return;
+    const cost = parseInt(btn.dataset.cost, 10);
+    subtractElixir(cost);
+    btn.classList.remove('flash'); void btn.offsetWidth; btn.classList.add('flash');
+});
+
+els.btnResetElixir.addEventListener('click', () => resetElixirToMax());
+els.btnStart.addEventListener('click', () => startMatch());

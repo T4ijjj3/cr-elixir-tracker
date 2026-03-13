@@ -5,16 +5,15 @@
 
 // ─── Constants ───────────────────────────────────────────
 const REGEN_NORMAL_MS = 2800;
-const REGEN_TRIPLE_MS = 933;
 const REGEN_DOUBLE_MS = 1400;
 const MAX_ELIXIR = 10;
-const START_ELIXIR = 5;
+const START_ELIXIR = 7;
 const MATCH_DURATION_S = 180;
 const DOUBLE_ELIXIR_AT_S = 60;
 const TICK_INTERVAL_MS = 50;
 const DECK_SIZE = 8;
 const HAND_SIZE = 4;
-const VOICE_DEBOUNCE_MS = 600;
+const VOICE_DEBOUNCE_MS = 1200;
 const VOICE_HIGH_CONFIDENCE = 0.82;
 const VOICE_LOW_CONFIDENCE = 0.52;
 
@@ -87,11 +86,6 @@ let state = {
         lastAcceptedAt: 0,
         pendingCost: null,
         pendingCardText: '',
-        engine: 'whisper',
-        socketState: 'offline',
-        chunksSent: 0,
-        transcriptsReceived: 0,
-        lastTranscript: '',
     },
 };
 
@@ -107,7 +101,7 @@ function startMatch() {
     state.isDouble = false;
     state.matchTimeRemaining = MATCH_DURATION_S;
     state.history = [];
-    state.lastTick = Date.now();
+    state.lastTick = performance.now();
     state.cardCycle = [];
     state.handCards = [];
     state.queueCards = [];
@@ -158,41 +152,31 @@ function resetMatch() {
 }
 
 function tick() {
-    const now = Date.now();
+    const now = performance.now();
     const deltaMs = now - state.lastTick;
     state.lastTick = now;
 
     state.matchTimeRemaining -= deltaMs / 1000;
 
-    // Check phases based on matchTimeRemaining (starts at 180)
-    // 180 to 60: 1x Elixir (2.8s)
-    // 60 to 0: 2x Elixir (1.4s)
-    // 0 to -60: Overtime 2x Elixir (1.4s)
-    // -60 onwards: 3x Elixir (0.933s)
+    if (state.matchTimeRemaining <= 0) {
+        state.matchTimeRemaining = 0;
+        updateTimerUI();
+        resetMatch();
+        return;
+    }
 
-    if (state.matchTimeRemaining <= 60 && state.matchTimeRemaining > -60 && !state.isDouble) {
+    if (!state.isDouble && state.matchTimeRemaining <= DOUBLE_ELIXIR_AT_S) {
         state.isDouble = true;
         state.regenMs = REGEN_DOUBLE_MS;
-        els.matchPhase.textContent = state.matchTimeRemaining <= 0 ? 'OVERTIME 2x' : '2x ELIXIR';
+        els.matchPhase.textContent = '2x ELIXIR';
         els.matchPhase.className = 'match-phase double';
         els.timerDisplay.classList.add('double-time');
         els.regenRate.textContent = '1.4s / ponto';
-    } else if (state.matchTimeRemaining <= 0 && state.isDouble && els.matchPhase.textContent !== 'OVERTIME 2x') {
-        els.matchPhase.textContent = 'OVERTIME 2x';
     }
 
-    if (state.matchTimeRemaining <= -60 && state.regenMs !== REGEN_TRIPLE_MS) {
-        state.regenMs = REGEN_TRIPLE_MS;
-        els.matchPhase.textContent = '3x ELIXIR!!';
-        els.matchPhase.className = 'match-phase triple';
-        els.timerDisplay.classList.add('triple-time');
-        els.regenRate.textContent = '0.9s / ponto';
-    }
-
-    if (state.matchTimeRemaining <= 15 && state.matchTimeRemaining > 0) {
+    if (state.matchTimeRemaining <= 15) {
+        els.timerDisplay.classList.remove('double-time');
         els.timerDisplay.classList.add('ending');
-    } else {
-        els.timerDisplay.classList.remove('ending');
     }
 
     state.elixir += deltaMs / state.regenMs;
@@ -268,7 +252,7 @@ function showCardList(type) {
     els.identifyStepType.style.display = 'none';
     els.identifyStepCard.style.display = 'block';
 
-    const identifiedNames = state.opponentDeck.filter(c => c.confirmed).map(c => c.name);
+    const identifiedNames = state.opponentDeck.map(c => c.name);
     const scored = (type === 'all')
         ? getScoredCardsForCost(state.identifyCost, null, identifiedNames)
         : getScoredCardsForCost(state.identifyCost, type, identifiedNames);
@@ -461,78 +445,11 @@ function updateAll() {
     updatePredictedDeck();
 }
 
-
-function isSpamCounter(name) {
-    if (!name || /^\d+$/.test(name)) return false;
-    const dbCard = typeof ALL_CARDS !== 'undefined' ? ALL_CARDS.find(c => c.name === name) : null;
-    return dbCard && dbCard.isCounterToSpam === true;
-}
-
-function checkVulnerability() {
-    if (!state.running) return false;
-    
-    // Se menor que 3 de elixir = Morte certa pro oponente, push!
-    if (state.elixir < 3) return true; 
-    
-    // Se 5 ou mais, oponente tem elixir suficiente para defender
-    if (state.elixir >= 4.5) return false; 
-    
-    // Se tem entre 3 e 4.5 de elixir, vamos olhar a mão e os counters
-    let hasCounterInHand = false;
-    
-    if (state.handCards && state.handCards.length > 0) {
-        for (let c of state.handCards) {
-            if (isSpamCounter(c.name)) hasCounterInHand = true;
-        }
-    }
-    
-    // Se elxir ta em 3 ou 4 e o oponente NAO tem cartas chaves na mão
-    if (!hasCounterInHand) {
-        return true;
-    }
-
-    return false;
-}
-
-function updateVulnerabilityUI() {
-    const banner = document.getElementById('vulnerabilityBanner');
-    const reason = document.getElementById('vulnerabilityReason');
-    if(!banner) return;
-    
-    const isVuln = checkVulnerability();
-    
-    if (isVuln) {
-        if(banner.style.display !== 'block') banner.style.display = 'block';
-        if(!document.body.classList.contains('vulnerable')) document.body.classList.add('vulnerable');
-        
-        let text = 'Baixo Elixir!';
-        if (state.elixir < 3) {
-            text = `Elixir Crítico (${Math.floor(state.elixir)})! Punição Máxima!`;
-        } else {
-            text = 'Livre de Defesas na Mão! PUSH!';
-        }
-        if (reason.innerText !== text) reason.innerText = text;
-    } else {
-        if(banner.style.display !== 'none') banner.style.display = 'none';
-        if(document.body.classList.contains('vulnerable')) document.body.classList.remove('vulnerable');
-    }
-}
-
 function updateElixirUI() {
     const d = Math.floor(state.elixir);
     els.elixirValue.textContent = d;
     els.elixirBarFill.style.width = (state.elixir / MAX_ELIXIR * 100) + '%';
     els.wastedValue.textContent = state.wasted.toFixed(1);
-    
-    // Smooth fractional UI to show it's constantly moving
-    if (!els.elixirFraction) {
-        els.elixirFraction = document.createElement('div');
-        els.elixirFraction.style.fontSize = '12px';
-        els.elixirFraction.style.color = '#ffcc00';
-        els.elixirFraction.style.marginTop = '4px';
-        els.elixirValue.parentElement.appendChild(els.elixirFraction);
-    }
-    els.elixirFraction.textContent = state.elixir.toFixed(2);
 }
 
 function updateTimerUI() {
@@ -717,16 +634,9 @@ function clearHistoryUI() {
 }
 
 function formatTime(s) {
-    if (s >= 0) {
-        const m = Math.floor(s / 60);
-        const sec = Math.floor(s % 60);
-        return m + ':' + sec.toString().padStart(2, '0');
-    } else {
-        const over = Math.abs(s);
-        const m = Math.floor(over / 60);
-        const sec = Math.floor(over % 60);
-        return '+' + m + ':' + sec.toString().padStart(2, '0');
-    }
+    const m = Math.floor(Math.max(0, s) / 60);
+    const sec = Math.floor(Math.max(0, s) % 60);
+    return m + ':' + sec.toString().padStart(2, '0');
 }
 
 function normalizeCardName(value) {
@@ -739,73 +649,14 @@ function normalizeCardName(value) {
         .trim();
 }
 
-function normalizeLooseText(value) {
+function normalizeVoiceText(value) {
     return normalizeCardName(value)
         .replace(/[^a-z0-9\s]/g, ' ')
         .replace(/\s+/g, ' ')
         .trim();
 }
 
-const VOICE_CARD_ALIAS_PAIRS = [
-    ['valkiria', 'valquiria'],
-    ['valquiria', 'valquiria'],
-    ['mega cavaleiro', 'megacavaleiro'],
-    ['mega', 'megacavaleiro'],
-    ['pekka', 'p e k k a'],
-    ['p e k k a', 'p e k k a'],
-    ['peka', 'p e k k a'],
-    ['pecca', 'p e k k a'],
-    ['peca', 'p e k k a'],
-    ['pecka', 'p e k k a'],
-    ['pekaa', 'p e k k a'],
-    ['peka pekka', 'p e k k a'],
-    ['x besta', 'x besta'],
-    ['zap', 'choque zap'],
-    ['tronco', 'o tronco'],
-    ['bruxa mae', 'bruxa mae'],
-    ['bruxa sombria', 'bruxa sombria'],
-    ['bebe dragao', 'bebe dragao'],
-    ['arqueiro magico', 'arqueiro magico'],
-    ['mago eletrico', 'mago eletrico'],
-    ['principe das trevas', 'principe das trevas'],
-    ['espirito eletrico', 'espirito eletrico'],
-    ['espirito de fogo', 'espirito de fogo'],
-    ['espirito de gelo', 'espirito de gelo'],
-    ['espirito curador', 'espirito curador'],
-];
-
-function normalizeVoiceCardText(value) {
-    let text = normalizeLooseText(value);
-    if (!text) return '';
-
-    VOICE_CARD_ALIAS_PAIRS.forEach(([from, to]) => {
-        const fromNorm = normalizeLooseText(from);
-        const toNorm = normalizeLooseText(to);
-        if (!fromNorm || !toNorm) return;
-        const pattern = new RegExp(`\\b${fromNorm}\\b`, 'g');
-        text = text.replace(pattern, toNorm);
-    });
-
-    return text
-        .replace(/\b(carta|carta de|custo|elixir|solta|joga|jogar|vai|usa|usar|manda|de)\b/g, ' ')
-        .replace(/\s+/g, ' ')
-        .trim();
-}
-
-function normalizeVoiceText(value) {
-    return normalizeVoiceCardText(value)
-    // Ensure tokens like "bruxa5" or "5bruxa" are separated for parsing.
-    .replace(/([a-z])(\d)/g, '$1 $2')
-    .replace(/(\d)([a-z])/g, '$1 $2')
-        .replace(/[^a-z0-9\s]/g, ' ')
-        .replace(/\s+/g, ' ')
-        .trim();
-}
-
 function parseSpokenCostToken(token) {
-    const cleanedToken = (token || '').toString().trim().replace(/[^a-z0-9]/g, '');
-    if (!cleanedToken) return null;
-
     const words = {
         zero: 0,
         um: 1,
@@ -822,12 +673,12 @@ function parseSpokenCostToken(token) {
         dez: 10,
     };
 
-    if (/^\d+$/.test(cleanedToken)) {
-        const n = parseInt(cleanedToken, 10);
+    if (/^\d+$/.test(token)) {
+        const n = parseInt(token, 10);
         return n >= 0 && n <= 10 ? n : null;
     }
 
-    return Object.prototype.hasOwnProperty.call(words, cleanedToken) ? words[cleanedToken] : null;
+    return Object.prototype.hasOwnProperty.call(words, token) ? words[token] : null;
 }
 
 function extractVoiceCostAndCard(transcript) {
@@ -857,7 +708,7 @@ function extractVoiceCostAndCard(transcript) {
     return {
         normalized,
         cost,
-        cardText: normalizeVoiceCardText(cardTokens.join(' ').trim()),
+        cardText: cardTokens.join(' ').trim(),
     };
 }
 
@@ -886,8 +737,8 @@ function levenshteinDistance(a, b) {
 }
 
 function nameSimilarity(a, b) {
-    const aa = normalizeLooseText(a);
-    const bb = normalizeLooseText(b);
+    const aa = normalizeCardName(a);
+    const bb = normalizeCardName(b);
     if (!aa || !bb) return 0;
     if (aa === bb) return 1;
     const maxLen = Math.max(aa.length, bb.length) || 1;
@@ -905,15 +756,7 @@ function updateVoiceUI(mode, message, transcript) {
     els.btnVoice.className = `btn-voice ${mode === 'listening' ? 'listening' : ''}`;
     els.voiceDot.className = `voice-dot ${mode}`;
     els.voiceStatusText.textContent = message || 'Voz inativa';
-
-    if (typeof transcript === 'string' && transcript.trim()) {
-        state.voice.lastTranscript = transcript.trim();
-    }
-
-    const debugText = `motor:${state.voice.engine || 'n/a'} | socket:${state.voice.socketState} | chunks:${state.voice.chunksSent} | ia:${state.voice.transcriptsReceived}`;
-    els.voiceTranscript.textContent = state.voice.lastTranscript
-        ? `${state.voice.lastTranscript}\n${debugText}`
-        : debugText;
+    els.voiceTranscript.textContent = transcript || '';
 
     if (mode === 'error') {
         els.btnVoice.classList.add('error');
@@ -927,7 +770,7 @@ function getVoiceContextCandidates(cost) {
         return state._currentCards;
     }
 
-    const identified = state.opponentDeck.filter(c => c.confirmed).map(c => c.name);
+    const identified = state.opponentDeck.map(c => c.name);
     return getScoredCardsForCost(cost, null, identified);
 }
 
@@ -935,13 +778,8 @@ function getBestVoiceCardMatch(cardText, cost) {
     const candidates = getVoiceContextCandidates(cost);
     if (!candidates || candidates.length === 0) return null;
 
-    const normalizedInput = normalizeVoiceCardText(cardText);
+    const normalizedInput = normalizeCardName(cardText);
     if (!normalizedInput) return null;
-
-    const aliasExact = candidates.find(card => normalizeVoiceCardText(card.name) === normalizedInput);
-    if (aliasExact) {
-        return { card: aliasExact, confidence: 1, inferred: false };
-    }
 
     const ranked = candidates
         .map(card => ({ card, confidence: nameSimilarity(normalizedInput, card.name) }))
@@ -958,7 +796,7 @@ function getBestVoiceCardMatch(cardText, cost) {
         return { card: top.card, confidence: top.confidence, inferred: true };
     }
 
-    return null;
+    return { card: candidates[0], confidence: top.confidence, inferred: true };
 }
 
 function tryApplyVoicePendingCard() {
@@ -968,9 +806,7 @@ function tryApplyVoicePendingCard() {
 
     const match = getBestVoiceCardMatch(state.voice.pendingCardText, state.identifyCost);
     if (!match || !match.card) {
-        state.voice.pendingCardText = '';
-        state.voice.pendingCost = null;
-        updateVoiceUI('processing', `Elixir ${state.identifyCost} registrado. Nao chutei carta para evitar erro.`);
+        updateVoiceUI('processing', `Elixir ${state.identifyCost} registrado. Complete a carta manualmente.`);
         return;
     }
 
@@ -983,17 +819,9 @@ function tryApplyVoicePendingCard() {
 }
 
 function handleVoicePlay(cost, cardText) {
-    const now = Date.now();
-    if (state.voice.lastPlayedCost === cost && (now - state.voice.lastPlayedTime) < 1500 && !cardText) {
-        console.log('Ignorando custo duplicado (debounce de 1.5s): ' + cost);
-        return;
-    }
-    state.voice.lastPlayedCost = cost;
-    state.voice.lastPlayedTime = now;
-
     if (!state.running) {
-        startMatch();
-        updateVoiceUI('processing', 'Partida iniciada por voz.');
+        updateVoiceUI('error', 'Inicie a partida antes de usar voz.');
+        return;
     }
 
     if (state.deckComplete) {
@@ -1017,72 +845,21 @@ function handleVoicePlay(cost, cardText) {
     if (cardText) {
         tryApplyVoicePendingCard();
     } else {
-        updateVoiceUI('processing', `Elixir ${cost} registrado. (Placa não informada)`);
-        // We will just let them keep playing without requiring manual completion.
-        // We close the identification if it is open
-        closeIdentification();
+        updateVoiceUI('processing', `Elixir ${cost} registrado. Complete a carta manualmente.`);
     }
 }
 
-function processVoiceTranscript(transcript, resultIndex = -1) {
+function processVoiceTranscript(transcript) {
     const parsed = extractVoiceCostAndCard(transcript);
     if (!parsed) return;
 
     const now = Date.now();
-    const isSameUtteranceByIndex = resultIndex !== -1 && resultIndex === state.voice.lastResultIndex;
-    
-    // We treat as the same utterance ONLY if it's exactly the same Web Speech result block
-    const isSameUtterance = isSameUtteranceByIndex;
-
-    if (isSameUtterance) {
-        if (parsed.normalized === state.voice.lastAcceptedText) return;
-
-        state.voice.lastAcceptedText = parsed.normalized;
-        if (resultIndex !== -1) state.voice.lastResultIndex = resultIndex;
-
-        if (parsed.cardText) {
-            if (state.identifying) {
-                state.voice.pendingCardText = parsed.cardText;
-                tryApplyVoicePendingCard();
-            } else if (state.history.length > 0) {
-                const lastEntry = state.history[0];
-                if (lastEntry.type === 'card' && lastEntry.cost === parsed.cost) {
-                    const match = getBestVoiceCardMatch(parsed.cardText, parsed.cost);
-                    if (match && match.card && match.card.name !== lastEntry.cardName) {
-                        
-                        if (!state.deckComplete && lastEntry.cardName !== parsed.cost.toString()) {
-                            const oldCard = state.opponentDeck.find(c => c.name === lastEntry.cardName);
-                            if (oldCard) {
-                                oldCard.name = match.card.name;
-                                const cardData = ALL_CARDS.find(c => c.name === oldCard.name);
-                                if (cardData) oldCard.type = cardData.type;
-                            }
-                        }
-
-                        lastEntry.cardName = match.card.name;
-                        
-                        if (typeof state.cardCycle !== 'undefined' && state.cardCycle.length > 0) {
-                            const lastCycle = state.cardCycle[state.cardCycle.length - 1];
-                            if (lastCycle.cost === parsed.cost) {
-                                lastCycle.name = match.card.name;
-                                if (typeof rebuildCyclePrediction === 'function') {
-                                    rebuildCyclePrediction();
-                                }
-                            }
-                        }
-
-                        updateAll();
-                        updateVoiceUI('processing', `Carta corrigida p/: ${match.card.name}`);
-                    }
-                }
-            }
-        }
+    if (parsed.normalized === state.voice.lastAcceptedText && (now - state.voice.lastAcceptedAt) < VOICE_DEBOUNCE_MS) {
         return;
     }
 
     state.voice.lastAcceptedText = parsed.normalized;
     state.voice.lastAcceptedAt = now;
-    state.voice.lastResultIndex = resultIndex;
 
     if (state.identifying && !parsed.cost && parsed.cardText) {
         state.voice.pendingCost = state.identifyCost;
@@ -1091,527 +868,10 @@ function processVoiceTranscript(transcript, resultIndex = -1) {
         return;
     }
 
-    if (!parsed.cost && !state.identifying) {
-        let inferredCost = null;
-        let inferredName = null;
-        const norm = normalizeVoiceCardText(parsed.cardText);
-        
-        if (norm) {
-            let exactMatch = state.opponentDeck.find(c => normalizeVoiceCardText(c.name) === norm);
-            if (!exactMatch && typeof ALL_CARDS !== 'undefined') {
-                exactMatch = ALL_CARDS.find(c => normalizeVoiceCardText(c.name) === norm);
-            }
-            if (exactMatch) {
-                inferredCost = exactMatch.cost;
-                inferredName = exactMatch.name;
-            }
-        }
-
-        if (inferredCost) {
-            parsed.cost = inferredCost;
-            parsed.cardText = inferredName; // Auto correction
-        } else {
-            updateVoiceUI('error', 'Fale um custo entre 1 e 10 ou nome exato.');
-            return;
-        }
+    if (!parsed.cost) {
+        updateVoiceUI('error', 'Fale um custo entre 1 e 10.');
+        return;
     }
 
     handleVoicePlay(parsed.cost, parsed.cardText);
-}
-let mediaRecorder;
-let audioChunks = [];
-let voiceSocket;
-let audioContext;
-let analyser;
-let microphone;
-let startRecordingWordTimeout;
-let silenceTimer;
-let isRecordingWord = false;
-let vadFrameId;
-const VOICE_SILENCE_MS = 900;
-const VOICE_RMS_THRESHOLD = 0.018;
-const WHISPER_FALLBACK_MS = 6500;
-let whisperFallbackTimer;
-const VOICE_ENGINE_PREFERENCE = 'browser-first';
-
-function getBrowserSpeechRecognitionCtor() {
-    return window.SpeechRecognition || window.webkitSpeechRecognition || null;
-}
-
-function getSupportedRecorderMimeType() {
-    const candidates = [
-        'audio/webm;codecs=opus',
-        'audio/webm',
-        'audio/ogg;codecs=opus',
-        'audio/ogg',
-    ];
-
-    if (typeof MediaRecorder === 'undefined' || typeof MediaRecorder.isTypeSupported !== 'function') {
-        return '';
-    }
-
-    return candidates.find(type => MediaRecorder.isTypeSupported(type)) || '';
-}
-
-function initVoiceRecognition() {
-    const hasBrowserSpeech = !!getBrowserSpeechRecognitionCtor();
-    const isFileProtocol = window.location.protocol === 'file:';
-    const isSecure = window.isSecureContext || window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
-
-    state.voice.supported = !isFileProtocol && isSecure && hasBrowserSpeech;
-    if (!state.voice.supported) {
-        if (els.btnVoice) els.btnVoice.disabled = true;
-        if (isFileProtocol || !isSecure) {
-            updateVoiceUI('error', 'Abra em http://localhost:8080 para liberar o microfone.');
-        } else {
-            updateVoiceUI('error', 'Este navegador nao suporta captura de voz nativa.');
-        }
-        return;
-    }
-
-    state.voice.engine = 'browser';
-    updateVoiceUI('idle', 'Modo browser pronto. Clique em VOZ.');
-}
-
-async function connectWhisperSocket() {
-    return new Promise((resolve) => {
-        state.voice.socketState = 'connecting';
-        updateVoiceUI('processing', 'Conectando ao servidor local...');
-        voiceSocket = new WebSocket('ws://localhost:8765');
-        
-        voiceSocket.onopen = () => {
-            state.voice.socketState = 'online';
-            console.log('🔗 Conectado ao Servidor Whisper Local');
-            updateVoiceUI('idle', 'IA Whisper pronta. Clique em VOZ.');
-            resolve(true);
-        };
-        
-        voiceSocket.onmessage = (event) => {
-            const transcript = event.data;
-            if (transcript.trim()) {
-                state.voice.transcriptsReceived += 1;
-                updateVoiceUI('listening', 'Lendo IA...', transcript);
-                processVoiceTranscript(transcript);
-                
-                // Keep UI updated briefly before switching to listening again if still active
-                if (state.voice.listening && !state.voice.manuallyStopped) {
-                    setTimeout(() => updateVoiceUI('listening', 'Escutando você...'), 2000);
-                }
-            }
-        };
-
-        voiceSocket.onerror = () => {
-            state.voice.socketState = 'error';
-            updateVoiceUI('error', 'Sem conexão com Servidor Python.');
-            resolve(false);
-        };
-
-        voiceSocket.onclose = () => {
-            state.voice.socketState = 'offline';
-            updateVoiceUI('idle', state.voice.listening ? 'Voz desconectada.' : 'Voz inativa');
-            console.log('Servidor Whisper desconectado.');
-        }
-    });
-}
-
-function stopAllAudio() {
-    clearTimeout(whisperFallbackTimer);
-    cancelAnimationFrame(vadFrameId);
-    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-        mediaRecorder.stop();
-    }
-    if (microphone) microphone.disconnect();
-    if (audioContext) audioContext.close();
-    if (mediaRecorder && mediaRecorder.stream) {
-        mediaRecorder.stream.getTracks().forEach(t => t.stop());
-    }
-    clearTimeout(silenceTimer);
-    clearTimeout(startRecordingWordTimeout);
-    isRecordingWord = false;
-    audioChunks = [];
-}
-
-function stopBrowserRecognition() {
-    if (!state.voice.recognition) return;
-    const recognition = state.voice.recognition;
-    state.voice.recognition = null;
-    recognition.onresult = null;
-    recognition.onerror = null;
-    recognition.onend = null;
-    try {
-        recognition.stop();
-    } catch (err) {
-        console.warn('Nao foi possivel parar reconhecimento do navegador.', err);
-    }
-}
-
-function startBrowserRecognition() {
-    const RecognitionCtor = getBrowserSpeechRecognitionCtor();
-    if (!RecognitionCtor) {
-        updateVoiceUI('error', 'Reconhecimento nativo indisponivel neste navegador.');
-        return false;
-    }
-
-    const recognition = new RecognitionCtor();
-    recognition.lang = 'pt-BR';
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.maxAlternatives = 1;
-
-    recognition.onresult = (event) => {
-        for (let i = event.resultIndex; i < event.results.length; i++) {
-            const result = event.results[i];
-            if (!result || !result[0]) continue;
-            const transcript = (result[0].transcript || '').trim();
-            if (!transcript) continue;
-
-            state.voice.transcriptsReceived += 1;
-            updateVoiceUI('listening', 'Lendo voz do navegador...', transcript);
-            processVoiceTranscript(transcript, i);
-        }
-    };
-
-    recognition.onerror = (event) => {
-        console.warn('SpeechRecognition erro', event.error);
-        if (!state.voice.listening || state.voice.manuallyStopped) return;
-        if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
-            updateVoiceUI('error', 'Permissao do microfone negada no navegador.');
-            state.voice.listening = false;
-            return;
-        }
-        updateVoiceUI('processing', 'Reconectando reconhecimento local...');
-    };
-
-    recognition.onend = () => {
-        if (!state.voice.listening || state.voice.manuallyStopped || state.voice.engine !== 'browser') return;
-        setTimeout(() => {
-            if (!state.voice.listening || state.voice.manuallyStopped) return;
-            try {
-                recognition.start();
-            } catch (err) {
-                console.warn('Falha ao reiniciar SpeechRecognition.', err);
-                updateVoiceUI('error', 'Falha no reconhecimento local do navegador.');
-                state.voice.listening = false;
-            }
-        }, 300);
-    };
-
-    state.voice.recognition = recognition;
-    try {
-        recognition.start();
-        updateVoiceUI('listening', 'Modo browser ativo. Escutando voce...');
-        return true;
-    } catch (err) {
-        console.error('Falha ao iniciar SpeechRecognition.', err);
-        updateVoiceUI('error', 'Falha ao iniciar reconhecimento local.');
-        state.voice.recognition = null;
-        return false;
-    }
-}
-
-function switchToBrowserFallback(reason) {
-    if (!state.voice.listening || state.voice.manuallyStopped || state.voice.engine === 'browser') return;
-
-    stopAllAudio();
-    if (voiceSocket && voiceSocket.readyState === WebSocket.OPEN) {
-        voiceSocket.close();
-    }
-
-    state.voice.socketState = 'fallback';
-    state.voice.engine = 'browser';
-    updateVoiceUI('processing', reason || 'Whisper sem resposta. Ativando modo browser...');
-
-    const started = startBrowserRecognition();
-    if (!started) {
-        state.voice.listening = false;
-    }
-}
-
-function startSpeechRecording() {
-    if (!mediaRecorder || state.voice.manuallyStopped || !state.voice.listening) return;
-    if (mediaRecorder.state !== 'inactive') return;
-
-    audioChunks = [];
-    mediaRecorder.start();
-    updateVoiceUI('listening', '(Gravando...)');
-    isRecordingWord = true;
-}
-
-function stopSpeechRecording() {
-    clearTimeout(silenceTimer);
-    if (!mediaRecorder || mediaRecorder.state !== 'recording') return;
-
-    isRecordingWord = false;
-    updateVoiceUI('processing', 'IA processando...');
-    mediaRecorder.stop();
-}
-
-async function startVADRecording() {
-    try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-            audio: {
-                echoCancellation: true,
-                noiseSuppression: true,
-                autoGainControl: true,
-            },
-        });
-
-        audioContext = new AudioContext();
-        await audioContext.resume();
-        analyser = audioContext.createAnalyser();
-        analyser.fftSize = 2048;
-        microphone = audioContext.createMediaStreamSource(stream);
-        microphone.connect(analyser);
-        const timeDomainData = new Uint8Array(analyser.fftSize);
-
-        const mimeType = getSupportedRecorderMimeType();
-        mediaRecorder = mimeType
-            ? new MediaRecorder(stream, { mimeType })
-            : new MediaRecorder(stream);
-
-        mediaRecorder.ondataavailable = e => {
-            if (e.data.size > 0 && voiceSocket && voiceSocket.readyState === WebSocket.OPEN) {
-                state.voice.chunksSent += 1;
-                const blob = new Blob([e.data], { type: mediaRecorder.mimeType || e.data.type || 'audio/webm' });
-                voiceSocket.send(blob);
-                updateVoiceUI('processing', 'Audio enviado para IA...');
-            }
-        };
-        mediaRecorder.onstop = () => {
-            clearTimeout(silenceTimer);
-        };
-        mediaRecorder.onerror = (event) => {
-            console.error('MediaRecorder error', event.error || event);
-            updateVoiceUI('error', 'Falha ao capturar audio do microfone.');
-            state.voice.listening = false;
-        };
-
-        function detectSpeech() {
-            if (state.voice.manuallyStopped || !state.voice.listening) return;
-
-            analyser.getByteTimeDomainData(timeDomainData);
-            let sumSquares = 0;
-            for (let i = 0; i < timeDomainData.length; i++) {
-                const normalized = (timeDomainData[i] - 128) / 128;
-                sumSquares += normalized * normalized;
-            }
-
-            const rms = Math.sqrt(sumSquares / timeDomainData.length);
-
-            if (rms >= VOICE_RMS_THRESHOLD) {
-                clearTimeout(silenceTimer);
-                if (!isRecordingWord) {
-                    startSpeechRecording();
-                }
-
-                silenceTimer = setTimeout(() => {
-                    stopSpeechRecording();
-                }, VOICE_SILENCE_MS);
-            }
-
-            vadFrameId = requestAnimationFrame(detectSpeech);
-        }
-
-        state.voice.listening = true;
-        updateVoiceUI('listening', 'Escutando voce...');
-        detectSpeech();
-
-    } catch(err) {
-        console.error(err);
-        updateVoiceUI('error', 'Permissao do microfone negada ou indisponivel.');
-        state.voice.listening = false;
-    }
-}
-
-async function toggleVoiceListening() {
-    if (!state.voice.supported) return;
-
-    if (state.voice.listening) {
-        state.voice.manuallyStopped = true;
-        state.voice.listening = false;
-
-        stopBrowserRecognition();
-        
-        stopAllAudio();
-        
-        if (voiceSocket && voiceSocket.readyState === WebSocket.OPEN) {
-            voiceSocket.close();
-        }
-        
-        updateVoiceUI('idle', 'Voz inativa');
-        return;
-    }
-
-    state.voice.manuallyStopped = false;
-    state.voice.chunksSent = 0;
-    state.voice.transcriptsReceived = 0;
-    state.voice.lastTranscript = '';
-
-    const hasBrowserSpeech = !!getBrowserSpeechRecognitionCtor();
-    if (true) {
-        state.voice.engine = 'browser';
-        state.voice.socketState = 'offline';
-        state.voice.listening = true;
-        updateVoiceUI('processing', 'Iniciando reconhecimento do navegador...');
-        const started = startBrowserRecognition();
-        if (!started) state.voice.listening = false;
-        return;
-    }
-
-    clearTimeout(whisperFallbackTimer);
-    whisperFallbackTimer = setTimeout(() => {
-        if (state.voice.engine !== 'whisper' || !state.voice.listening || state.voice.manuallyStopped) return;
-        if (state.voice.transcriptsReceived === 0 && state.voice.chunksSent >= 1) {
-            switchToBrowserFallback('Whisper sem resposta. Trocando para modo browser...');
-        }
-    }, WHISPER_FALLBACK_MS);
-}
-
-// ─── Events ──────────────────────────────────────────────
-
-if (els.btnVoice) {
-    els.btnVoice.addEventListener('click', (e) => {
-        if (e.target && e.target.blur) e.target.blur();
-        toggleVoiceListening();
-    });
-}
-
-els.cardButtons.addEventListener('click', e => {
-    const btn = e.target.closest('.card-btn');
-    if (!btn) return;
-    const cost = parseInt(btn.dataset.cost, 10);
-    subtractElixir(cost);
-    
-
-    const allBtns = els.cardButtons.querySelectorAll('.btn-card');
-    allBtns.forEach(b => b.classList.remove('active'));
-    btn.classList.add('active');
-    btn.classList.remove('flash'); void btn.offsetWidth; btn.classList.add('flash');
-
-
-
-});
-
-els.btnResetElixir.addEventListener('click', () => resetElixirToMax());
-els.btnStart.addEventListener('click', () => startMatch());
-
-document.querySelector('.cycle-grid').addEventListener('click', e => {
-    const cardEl = e.target.closest('.cycle-card');
-    if (!cardEl) return;
-    if (cardEl.dataset.cardName) {
-        removeCardFromCycle(cardEl.dataset.cardName);
-    }
-});
-
-document.querySelector('.deck-section').addEventListener('click', e => {
-    const identifiedSlot = e.target.closest('.deck-slot:not(.empty):not(.predicted)');
-    if (identifiedSlot && identifiedSlot.dataset.cardName) {
-        const removedMatch = state.opponentDeck.find(c => c.name === identifiedSlot.dataset.cardName && c.confirmed);
-        if (removedMatch) {
-            removedMatch.confirmed = false;
-            updateOpponentDeckUI();
-            updatePredictedDeck();
-        }
-        return;
-    }
-
-    const slot = e.target.closest('.deck-slot.predicted');
-    if (slot && slot.dataset.cardName) {
-        confirmPredictedCard(slot.dataset.cardName);
-    }
-});
-
-document.addEventListener('keydown', e => {
-    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
-    
-    // Disable the Enter key globally outside of inputs so it doesn't accidentally trigger focused buttons (like the Voice button)
-    if (e.key === 'Enter') {
-        e.preventDefault();
-        return;
-    }
-    
-    const key = e.key.toUpperCase();
-    const raw = e.key.toLowerCase();
-
-    // Number keys and Q ALWAYS work, even during identification
-    if (raw === 'q') { e.preventDefault(); resetElixirToMax(); return; }
-    if (raw === 'r') { 
-        e.preventDefault(); 
-        const unconfirmed = state.opponentDeck.filter(c => !c.confirmed).map(c => c.name);
-        if (unconfirmed.length > 0) {
-            state.discardedPredictions.push(...unconfirmed);
-            autoFillPredictions();
-        }
-        return; 
-    }
-    if (raw === ' ' || e.code === 'Space') { e.preventDefault(); startMatch(); return; }
-    if (raw >= '0' && raw <= '9') {
-        e.preventDefault();
-        const cost = raw === '0' ? 10 : parseInt(raw, 10);
-        subtractElixir(cost);
-        const btn = els.cardButtons.querySelector(`[data-cost="${cost}"]`);
-        if (btn) { 
-
-    const allBtns = els.cardButtons.querySelectorAll('.btn-card');
-    allBtns.forEach(b => b.classList.remove('active'));
-    btn.classList.add('active');
-    btn.classList.remove('flash'); void btn.offsetWidth; btn.classList.add('flash');
-
-
- }
-        return;
-    }
-
-    // Identification panel shortcuts (only when panel is open)
-    if (state.identifying) {
-        if (els.identifyStepType.style.display !== 'none') {
-            if (raw === 'z') { e.preventDefault(); selectType('troop'); return; }
-            if (raw === 'x') { e.preventDefault(); selectType('spell'); return; }
-            if (raw === 'c') { e.preventDefault(); selectType('building'); return; }
-            if (raw === 'v') { e.preventDefault(); selectType('hero'); return; }
-            if (raw === 'escape') { e.preventDefault(); closeIdentifyModal(); return; }
-            return;
-        }
-        if (els.identifyStepCard.style.display !== 'none') {
-            if (raw === '/') { e.preventDefault(); confirmCardIdentification('__skip__'); return; }
-            if (raw === 'escape') { e.preventDefault(); closeIdentifyModal(); return; }
-            if (raw === 'backspace') {
-                e.preventDefault();
-                els.identifyStepType.style.display = 'block';
-                els.identifyStepCard.style.display = 'none';
-                return;
-            }
-            if (state._currentCards) {
-                const match = state._currentCards.find(c => c.key === key);
-                if (match) { e.preventDefault(); confirmCardIdentification(match.name); return; }
-            }
-            return;
-        }
-        return;
-    }
-
-    // (number keys and Q handled above, before identification check)
-});
-
-// ─── Helpers ─────────────────────────────────────────────
-
-function getCardImage(cardName) {
-    if (!cardName) return '';
-    const targetName = normalizeCardName(cardName);
-    const card = ALL_CARDS.find(c => normalizeCardName(c.name) === targetName);
-    return card && card.image ? card.image : '';
-}
-
-// ─── Init ────────────────────────────────────────────────
-updateAll();
-try {
-    initVoiceRecognition();
-} catch (err) {
-    // Voice is optional; never break manual controls if voice init fails.
-    console.warn('Voice init failed, manual mode remains active.', err);
-}
-if ('serviceWorker' in navigator) {
-    window.addEventListener('load', () => {
-        navigator.serviceWorker.register('sw.js').then(r => console.log('SW Reg')).catch(e => console.error('SW Error', e));
-    });
 }
