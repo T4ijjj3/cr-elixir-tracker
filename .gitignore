@@ -8,3 +8,5 @@ patch_*.js
 
 # Local Whisper weights (too large for Git)
 models/distil-whisper-large-v3-ptbr-ct2/model.bin
+models/distil-whisper-large-v3-ptbr-ct2/
+models/raw/distil-whisper-large-v3-ptbr/
