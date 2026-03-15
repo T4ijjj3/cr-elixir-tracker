@@ -36,6 +36,44 @@ fi
 echo "🔄 Ativando ambiente..."
 source venv/bin/activate
 
+export CR_WHISPER_MAX_NEW_TOKENS="${CR_WHISPER_MAX_NEW_TOKENS:-18}"
+export CR_WHISPER_HOTWORD_LIMIT="${CR_WHISPER_HOTWORD_LIMIT:-96}"
+export CR_LOW_LATENCY_MODE="${CR_LOW_LATENCY_MODE:-1}"
+export CR_WHISPER_ALT_ENABLED="${CR_WHISPER_ALT_ENABLED:-0}"
+export CR_WHISPER_TARGET_RAM_GB="${CR_WHISPER_TARGET_RAM_GB:-16}"
+export CR_WHISPER_COMPUTE_TYPE="${CR_WHISPER_COMPUTE_TYPE:-int8}"
+
+CPU_THREADS_DEFAULT="$(nproc 2>/dev/null || echo 4)"
+if [ -z "${CR_WHISPER_CPU_THREADS:-}" ]; then
+    export CR_WHISPER_CPU_THREADS="$CPU_THREADS_DEFAULT"
+fi
+
+if [ -z "${CR_WHISPER_PTBR_MODEL:-}" ]; then
+    for candidate in \
+        "models/distil-whisper-large-v3-ptbr-ct2" \
+        "models/whisper-large-v3-ptbr-ct2" \
+        "models/whisper-ptbr-ct2"
+    do
+        if [ -d "$candidate" ]; then
+            export CR_WHISPER_PTBR_MODEL="$candidate"
+            echo "🇧🇷 Modelo PT-BR local detectado: $candidate"
+            break
+        fi
+    done
+fi
+
+if [ -z "${CR_WHISPER_MODEL:-}" ]; then
+    if [ -n "${CR_WHISPER_PTBR_MODEL:-}" ]; then
+        export CR_WHISPER_MODEL="$CR_WHISPER_PTBR_MODEL"
+    else
+        export CR_WHISPER_MODEL="small"
+    fi
+fi
+
+echo "🎯 Perfil de voz: latencia-alvo <=500ms (navegador prioritario) + Whisper forte para correcao final"
+echo "🧠 Modelo principal Whisper: ${CR_WHISPER_MODEL}"
+echo "🧵 Threads CPU Whisper: ${CR_WHISPER_CPU_THREADS}"
+
 echo "⬇️  Instalando Faster Whisper e Websockets..."
 pip install --upgrade pip
 pip install faster-whisper websockets torch typing-extensions

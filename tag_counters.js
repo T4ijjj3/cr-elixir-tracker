@@ -4,8 +4,8 @@ let code = fs.readFileSync('cards_db.js', 'utf8');
 const counters = [
     'Exército de Esqueletos', 'Gangue de Goblins', 'Bárbaros', 'Lápide', 
     'Horda de Servos', 'Esqueletos', 'Guardas', 'Torre Inferno', 
-    'Dragão Infernal', 'Mini P.E.K.K.A', 'Torre de Bombas', 'P.E.K.K.A', 
-    'Megacavaleiro', 'Lançador', 'Caçador', 'Arqueiro Mágico', 'Goblin com Dardo', 'Canhão', 'Tesla', 'Príncipe'
+    'Dragão Infernal', 'Mini PEKKA', 'Torre de Bombas', 'P.E.K.K.A', 
+    'Megacavaleiro', 'Lançador', 'Caçador', 'Arqueiro Mágico', 'Goblin com Dardos', 'Canhão', 'Tesla', 'Príncipe'
 ];
 
 let match;

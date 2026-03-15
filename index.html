@@ -14,12 +14,21 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;700;900&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="style_v2.css?v=35">
+    <link rel="stylesheet" href="style_v2.css?v=87">
 </head>
 
 <body>
-    <div id="version" style="position:fixed;top:0;right:0;background:red;color:white;z-index:9999;font-size:12px;padding:2px;">v36</div>
-    <div id="version" style="position:fixed;top:0;right:0;background:red;color:white;z-index:9999;font-size:12px;padding:2px;">v31</div>
+    <div id="version" style="position:fixed;top:0;right:0;background:red;color:white;z-index:9999;font-size:12px;padding:2px;">v87</div>
+    
+    
+    <!-- Feedback de vulnerabilidade (laterais) -->
+    <div id="vulnerabilitySideLeft" class="vulnerability-side left" style="display:none;" aria-hidden="true"></div>
+    <div id="vulnerabilitySideRight" class="vulnerability-side right" style="display:none;" aria-hidden="true"></div>
+    <div id="vulnerabilityBanner" class="vulnerability-pill" style="display:none;" onclick="this.style.display='none'">
+      ⚔️ Janela de Push
+      <div id="vulnerabilityReason">Baixo Elixir e Sem Defesa!</div>
+    </div>
+    
     <div class="desktop-layout">
 
         <!-- ===== LEFT COLUMN: Core tracker ===== -->
@@ -27,7 +36,7 @@
 
             <!-- Next Card Hero -->
             <section class="next-card-hero" id="nextCardHero">
-                <div class="next-card-label">⚡ PRÓXIMA CARTA A VOLTAR</div>
+                <div class="next-card-label">⚡ MÃO + FILA DO OPONENTE</div>
                 <div class="next-card-display" id="nextCardDisplay">
                     <span class="next-card-empty">Jogue cartas para rastrear</span>
                 </div>
@@ -93,6 +102,16 @@
                     <span class="voice-status-text" id="voiceStatusText">Voz inativa</span>
                 </div>
                 <div class="voice-transcript" id="voiceTranscript"></div>
+            </section>
+            <section class="voice-log-panel" id="voiceLogPanel" style="display:none;">
+                <div class="voice-log-head">
+                    <span class="voice-log-title">Relatório Técnico</span>
+                    <div class="voice-log-actions">
+                        <button class="voice-log-btn" id="btnCopyVoiceLog" type="button">Copiar</button>
+                        <button class="voice-log-btn secondary" id="btnClearVoiceLog" type="button">Limpar</button>
+                    </div>
+                </div>
+                <textarea class="voice-log-output" id="voiceLogOutput" readonly placeholder="Ative a voz para gerar histórico técnico copiável."></textarea>
             </section>
 
             <!-- Cycle -->
@@ -196,10 +215,30 @@
     </footer>
 
     <script src="cards_db.js?v=4"></script>
-    <script src="app_v2.js?v=32"></script>
+    <script src="app_v2.js?v=87"></script>
     <script>
         if ('serviceWorker' in navigator) {
-            navigator.serviceWorker.register('sw.js').then(() => console.log('Service Worker Registrado!'));
+            navigator.serviceWorker.register('sw.js').then((reg) => {
+                reg.update();
+
+                if (reg.waiting) {
+                    reg.waiting.postMessage({ type: 'SKIP_WAITING' });
+                }
+
+                reg.addEventListener('updatefound', () => {
+                    const next = reg.installing;
+                    if (!next) return;
+                    next.addEventListener('statechange', () => {
+                        if (next.state === 'installed' && navigator.serviceWorker.controller) {
+                            next.postMessage({ type: 'SKIP_WAITING' });
+                        }
+                    });
+                });
+            }).catch(() => {});
+
+            navigator.serviceWorker.addEventListener('controllerchange', () => {
+                window.location.reload();
+            });
         }
     </script>
     <script src="install-sw.js"></script>
