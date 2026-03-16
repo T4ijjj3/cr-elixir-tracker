@@ -27,6 +27,13 @@ const VOICE_ALLOW_GLOBAL_CARD_ONLY_INFERENCE = true;
 const VOICE_REPORT_LIMIT = 320;
 const VOICE_SLOT_HAND_LETTERS = ['A', 'B', 'C', 'D'];
 const VOICE_SLOT_QUEUE_LETTERS = ['E', 'F', 'G', 'H'];
+const VOICE_SLOT_HAND_LABELS = ['ALFA', 'BETA', 'CELTA', 'DELTA'];
+const VOICE_SLOT_LABEL_BY_LETTER = {
+    A: 'ALFA',
+    B: 'BETA',
+    C: 'CELTA',
+    D: 'DELTA',
+};
 const VOICE_STABLE_WINDOW_MS = 120;
 const VOICE_RECORDER_TIMESLICE_MS = 60;
 const VOICE_ENSEMBLE_GROUP_WINDOW_MS = 520;
@@ -143,6 +150,7 @@ let state = {
         awaitingCardOnlyCost: null,
         awaitingCardOnlyUntil: 0,
         lastMicLevel: 0,
+        currentMicGain: 1,
         lastAudioDetectedAt: 0,
         lastRecognitionLagMs: 0,
         lastSpeechStartedAt: 0,
@@ -337,6 +345,16 @@ function hasCompleteVisibleHandQueueMatrix(handCards = state.handCards, queueCar
         .map(card => normalizeCardName(card.name))
         .filter(Boolean);
     return combinedKeys.length === HAND_SIZE * 2 && new Set(combinedKeys).size === HAND_SIZE * 2;
+}
+
+function hasCompleteVisibleHand(handCards = state.handCards) {
+    const hand = (handCards || []).slice(0, HAND_SIZE);
+    if (hand.length < HAND_SIZE) return false;
+    if (!hand.every(isNamedVisibleCard)) return false;
+    const handKeys = hand
+        .map(card => normalizeCardName(card.name))
+        .filter(Boolean);
+    return handKeys.length === HAND_SIZE && new Set(handKeys).size === HAND_SIZE;
 }
 
 function tryAdvanceVisibleHandQueue(cardName, cost) {
@@ -835,6 +853,17 @@ function isLetterModeReady() {
     return hasFullVisibleSlotMatrix();
 }
 
+function getVoiceSlotDisplayLabel(letter, options = {}) {
+    const { scope = 'hand' } = options;
+    const normalized = (letter || '').toString().toUpperCase().trim();
+    if (!normalized) return '';
+    if (scope === 'hand') {
+        const idx = VOICE_SLOT_HAND_LETTERS.indexOf(normalized);
+        if (idx !== -1) return VOICE_SLOT_HAND_LABELS[idx] || normalized;
+    }
+    return VOICE_SLOT_LABEL_BY_LETTER[normalized] || normalized;
+}
+
 function inferDeckCardByCost(cost, preferredCardName = null) {
     const confirmedDeck = getConfirmedDeckCards();
     const byCost = confirmedDeck.filter(card => card.cost === cost);
@@ -1186,6 +1215,32 @@ function getMyDeckCounterThreatLevel(cardName) {
     return 'none';
 }
 
+// Slot danger highlight for the top "MÃO + FILA" tracker panel.
+// Includes explicit tactical threats requested for PEKKA Bridge Spam plus
+// naming variants used by card DB / speech recognition.
+const TRACKER_PEKKA_DANGER_CARDS = new Set([
+    'Exército de Esqueleto',
+    'Exército de Esqueletos',
+    'Tesla',
+    'Torre Infernal',
+    'Torre Inferno',
+    'Dragão Infernal',
+    'Mini P.E.K.K.A',
+    'Mini PEKKA',
+    'Lançador',
+]);
+
+const TRACKER_PEKKA_DANGER_CARDS_NORMALIZED = new Set(
+    Array.from(TRACKER_PEKKA_DANGER_CARDS).map(name => normalizeCardName(name)).filter(Boolean)
+);
+
+function isTrackerPekkaDangerCard(cardName) {
+    if (!cardName || /^\d+$/.test(cardName)) return false;
+    const normalized = normalizeCardName(cardName);
+    if (!normalized) return false;
+    return TRACKER_PEKKA_DANGER_CARDS_NORMALIZED.has(normalized);
+}
+
 const HARD_DEF_GROUPS = ['building', 'swarm', 'miniTank'];
 const DEF_GROUP_LABEL = {
     building: 'construção',
@@ -1526,7 +1581,6 @@ function updateTimerUI() {
 }
 
 function updateNextCardHero() {
-    const deckReadyForSlots = isLetterModeReady();
     const next = getNextCardPrediction();
     const handCards = (state.handCards || []).slice(0, HAND_SIZE);
     const queueCards = (state.queueCards || []).slice(0, HAND_SIZE);
@@ -1547,14 +1601,14 @@ function updateNextCardHero() {
         const cardFallback = isNamedCard ? getCardImageFallback(card.name) : '';
         const fallbackAttr = cardFallback ? ` data-fallback="${cardFallback}"` : '';
         const label = isNamedCard ? card.name : `${card.cost} elixir`;
-        const counterLevel = isNamedCard ? getMyDeckCounterThreatLevel(card.name) : 'none';
-        const counterClass = counterLevel !== 'none'
-            ? ` counter-threat counter-${counterLevel} ${queue ? 'counter-queue' : 'counter-hand'}`
-            : '';
+        const dangerClass = isNamedCard && isTrackerPekkaDangerCard(card.name)
+            ? ' danger-card'
+            : ' safe-card';
+        const queueClass = queue ? ' queue-slot' : ' hand-slot';
 
         if (cardUrl) {
             return `
-                <div class="top-track-card ${isNext ? 'is-next' : ''}${counterClass}" title="${label}">
+                <div class="top-track-card${dangerClass} ${isNext ? 'is-next' : ''}${queueClass}" title="${label}">
                     <img src="${cardUrl}" class="top-track-art" alt="${label}"${fallbackAttr} onerror="onCardArtError(this)">
                     <span class="top-track-cost">${card.cost}</span>
                 </div>
@@ -1562,7 +1616,7 @@ function updateNextCardHero() {
         }
 
         return `
-            <div class="top-track-card ${isNext ? 'is-next' : ''}${counterClass}" title="${label}">
+            <div class="top-track-card${dangerClass} ${isNext ? 'is-next' : ''}${queueClass}" title="${label}">
                 <span class="top-track-fallback">${card.cost}</span>
             </div>
         `;
@@ -1578,11 +1632,13 @@ function updateNextCardHero() {
         return slots.join('');
     };
 
-    const renderTopLetterRow = ({ queue = false } = {}) => {
-        const letters = queue ? VOICE_SLOT_QUEUE_LETTERS : VOICE_SLOT_HAND_LETTERS;
+    const renderTopHandLetterRow = () => {
+        const labels = VOICE_SLOT_HAND_LABELS.slice(0, HAND_SIZE);
         return `
             <div class="top-track-slot-letters" aria-hidden="true">
-                ${letters.map(letter => `<span class="top-track-slot-letter${deckReadyForSlots ? '' : ' locked'}">${letter}</span>`).join('')}
+                ${labels.map(displayLabel => {
+                    return `<span class="top-track-slot-letter">${displayLabel}</span>`;
+                }).join('')}
             </div>
         `;
     };
@@ -1592,14 +1648,13 @@ function updateNextCardHero() {
             <div class="top-track-row">
                 <span class="top-track-label">MÃO</span>
                 <div class="top-track-cards-wrap">
-                    ${renderTopLetterRow()}
+                    ${renderTopHandLetterRow()}
                     <div class="top-track-cards">${renderTopRow(handCards)}</div>
                 </div>
             </div>
             <div class="top-track-row">
                 <span class="top-track-label">FILA</span>
                 <div class="top-track-cards-wrap">
-                    ${renderTopLetterRow({ queue: true })}
                     <div class="top-track-cards">${renderTopRow(queueCards, { queue: true })}</div>
                 </div>
             </div>
@@ -1615,18 +1670,31 @@ function updateNextCardHero() {
 }
 
 function updateCycleUI() {
-    const showSlotLetters = isLetterModeReady();
-    const renderSlotLetter = (slotLetter) => (showSlotLetters && slotLetter)
-        ? `<span class="slot-letter-badge">${slotLetter}</span>`
-        : '';
+    const letterModeReady = isLetterModeReady();
+    const handSlotReady = hasCompleteVisibleHand();
+    const showHandSlotLabels = true;
+    const showQueueSlotLabels = letterModeReady;
+    const renderSlotLetter = (slotLetter, isQueue = false) => {
+        if (!slotLetter) return '';
+        if (!isQueue && !showHandSlotLabels) return '';
+        if (isQueue && !showQueueSlotLabels) return '';
+        const displayLabel = getVoiceSlotDisplayLabel(slotLetter, { scope: isQueue ? 'queue' : 'hand' });
+        const ready = isQueue ? letterModeReady : handSlotReady;
+        const lockedClass = !ready ? ' locked' : '';
+        const queueClass = isQueue ? ' queue' : ' hand';
+        return `<span class="slot-letter-badge${queueClass}${lockedClass}">${displayLabel}</span>`;
+    };
 
     const renderCycleCard = (c, isQueue = false, slotLetter = '') => {
         const threatLevel = (c.name && !/^\d+$/.test(c.name)) ? getMyDeckCounterThreatLevel(c.name) : 'none';
         const counterClass = threatLevel !== 'none' ? ` counter-threat counter-${threatLevel}` : '';
-        const classes = `cycle-card ${isQueue ? 'in-queue' : 'in-hand'}${counterClass}`;
+        const counterScopeClass = threatLevel !== 'none'
+            ? (isQueue ? ' counter-queue' : ' counter-hand')
+            : '';
+        const classes = `cycle-card ${isQueue ? 'in-queue' : 'in-hand'}${counterClass}${counterScopeClass}`;
         const returnsBadge = isQueue ? `<span class="returns-badge">${c.returnsIn}</span>` : '';
         const title = isQueue ? `${c.name} — volta em ${c.returnsIn}` : c.name;
-        const showImage = showSlotLetters && c.name && !/^\d+$/.test(c.name);
+        const showImage = letterModeReady && c.name && !/^\d+$/.test(c.name);
         const cardUrl = showImage ? getCardImage(c.name) : '';
         const cardFallback = showImage ? getCardImageFallback(c.name) : '';
         const fallbackAttr = cardFallback ? ` data-fallback="${cardFallback}"` : '';
@@ -1634,7 +1702,7 @@ function updateCycleUI() {
         const playIndexAttr = Number.isFinite(c.playIndex) ? ` data-play-index="${c.playIndex}"` : '';
         const dataAttrs = ` data-card-token="${cardToken}"${playIndexAttr}`;
         const removeBtn = `<button type="button" class="cycle-remove-btn" title="Excluir carta" data-card-token="${cardToken}"${playIndexAttr}>✕</button>`;
-        const slotLetterBadge = renderSlotLetter(slotLetter);
+        const slotLetterBadge = renderSlotLetter(slotLetter, isQueue);
 
         if (!cardUrl) {
             return `<div class="${classes}" title="${title}"${dataAttrs}>${removeBtn}${slotLetterBadge}${c.cost}${returnsBadge}</div>`;
@@ -1653,7 +1721,7 @@ function updateCycleUI() {
 
     const renderUnknownSlot = (slotLetter = '', isQueue = false) => {
         const classes = `cycle-card unknown${isQueue ? ' in-queue' : ''}`;
-        return `<div class="${classes}" title="Slot sem carta definida">${renderSlotLetter(slotLetter)}?</div>`;
+        return `<div class="${classes}" title="Slot sem carta definida">${renderSlotLetter(slotLetter, isQueue)}?</div>`;
     };
 
     const handSlots = [];
@@ -1664,7 +1732,7 @@ function updateCycleUI() {
     }
     els.cycleHand.innerHTML = handSlots.join('');
 
-    if (showSlotLetters) {
+    if (showQueueSlotLabels) {
         const queueSlots = [];
         for (let i = 0; i < HAND_SIZE; i++) {
             const card = state.queueCards[i] || null;
@@ -2126,6 +2194,13 @@ const VOICE_CARD_ALIAS_PAIRS = [
     ['arieti', 'ariete de batalha'],
     ['ari eti', 'ariete de batalha'],
     ['arietee', 'ariete de batalha'],
+    ['ariente', 'ariete de batalha'],
+    ['ariente batalha', 'ariete de batalha'],
+    ['aliete', 'ariete de batalha'],
+    ['aliete de batalha', 'ariete de batalha'],
+    ['aride batalha', 'ariete de batalha'],
+    ['aridi batalha', 'ariete de batalha'],
+    ['aridi de batalha', 'ariete de batalha'],
     ['ariete de batalia', 'ariete de batalha'],
     ['ariente de batalha', 'ariete de batalha'],
     // ─── Bola de Neve ───
@@ -2263,6 +2338,19 @@ const VOICE_CARD_ALIAS_PAIRS = [
     // ─── Pirotécnica ───
     ['firecracker', 'pirotecnica'],
     ['piro', 'pirotecnica'],
+    ['piro tecnica', 'pirotecnica'],
+    ['pro tecnica', 'pirotecnica'],
+    ['pirotequina', 'pirotecnica'],
+    ['pirotequinica', 'pirotecnica'],
+    ['pirotequica', 'pirotecnica'],
+    ['fogueteira', 'pirotecnica'],
+    ['foguetera', 'pirotecnica'],
+    ['foguete ira', 'pirotecnica'],
+    ['piro tenica', 'pirotecnica'],
+    ['pirotenica', 'pirotecnica'],
+    ['pirotekinica', 'pirotecnica'],
+    ['piroteknica', 'pirotecnica'],
+    ['pirotecnia', 'pirotecnica'],
     // ─── Bombardeiro ───
     ['bomber', 'bombardeiro'],
     // ─── Arqueiras ───
@@ -2404,6 +2492,11 @@ const VOICE_CARD_ALIAS_PAIRS = [
     // Pirotécnica mishearings
     ['pirotec', 'pirotecnica'], ['pirote', 'pirotecnica'],
     ['fogos', 'pirotecnica'],
+    ['pirotequina', 'pirotecnica'], ['pirotequinica', 'pirotecnica'],
+    ['fogueteira', 'pirotecnica'], ['foguetera', 'pirotecnica'],
+    ['piro tenica', 'pirotecnica'], ['pirotenica', 'pirotecnica'],
+    ['pirotekinica', 'pirotecnica'], ['piroteknica', 'pirotecnica'],
+    ['pirotecnia', 'pirotecnica'],
     // Arqueiro Mágico mishearings
     ['arqueiro', 'arqueiro magico'],
     // Dragão Infernal mishearings
@@ -2484,23 +2577,36 @@ function shouldApplyInlineVoiceAlias(alias) {
     return false;
 }
 
-const VOICE_ALIAS_REPLACEMENTS = VOICE_CARD_ALIAS_PAIRS
-    .map(([from, to]) => {
-        const fromNorm = normalizeLooseText(from);
-        const toNorm = normalizeLooseText(to);
-        if (!fromNorm || !toNorm) return null;
-        return {
-            fromNorm,
-            toNorm,
-            applyInline: shouldApplyInlineVoiceAlias(fromNorm),
-        };
-    })
-    .filter(Boolean)
-    .sort((a, b) => {
-        const tokenDiff = b.fromNorm.split(' ').length - a.fromNorm.split(' ').length;
-        if (tokenDiff !== 0) return tokenDiff;
-        return b.fromNorm.length - a.fromNorm.length;
+function escapeRegexLiteral(value) {
+    return (value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+const VOICE_ALIAS_REPLACEMENTS = (() => {
+    const prepared = VOICE_CARD_ALIAS_PAIRS
+        .map(([from, to]) => {
+            const fromNorm = normalizeLooseText(from);
+            const toNorm = normalizeLooseText(to);
+            if (!fromNorm || !toNorm) return null;
+            return {
+                fromNorm,
+                toNorm,
+                applyInline: shouldApplyInlineVoiceAlias(fromNorm),
+            };
+        })
+        .filter(Boolean)
+        .sort((a, b) => {
+            const tokenDiff = b.fromNorm.split(' ').length - a.fromNorm.split(' ').length;
+            if (tokenDiff !== 0) return tokenDiff;
+            return b.fromNorm.length - a.fromNorm.length;
+        });
+
+    const seen = new Set();
+    return prepared.filter(entry => {
+        if (seen.has(entry.fromNorm)) return false;
+        seen.add(entry.fromNorm);
+        return true;
     });
+})();
 
 const VOICE_EXACT_ALIAS_DEFER_TO_MATCHER = new Set([
     'barril',
@@ -2522,7 +2628,15 @@ function applyVoiceAliasNormalization(value) {
 
     VOICE_ALIAS_REPLACEMENTS.forEach(entry => {
         if (!entry.applyInline) return;
-        const pattern = new RegExp(`\\b${entry.fromNorm}\\b`, 'g');
+        const escapedFrom = escapeRegexLiteral(entry.fromNorm);
+        let pattern = new RegExp(`\\b${escapedFrom}\\b`, 'g');
+        if (entry.toNorm.startsWith(`${entry.fromNorm} `)) {
+            const tail = entry.toNorm.slice(entry.fromNorm.length).trim();
+            if (tail) {
+                const escapedTail = escapeRegexLiteral(tail).replace(/\s+/g, '\\s+');
+                pattern = new RegExp(`\\b${escapedFrom}\\b(?!\\s+${escapedTail}\\b)`, 'g');
+            }
+        }
         text = text.replace(pattern, entry.toNorm);
     });
 
@@ -2551,6 +2665,46 @@ function normalizeVoiceCardText(value) {
 
 function normalizeVoiceText(value) {
     return normalizeVoiceRawText(value);
+}
+
+const VOICE_PRIORITY_CARD_KEY_ARIETE = normalizeVoiceCardText('Aríete de Batalha');
+const VOICE_PRIORITY_CARD_KEY_PIROTECNICA = normalizeVoiceCardText('Pirotécnica');
+const VOICE_PRIORITY_CARD_KEY_FOGUETE = normalizeVoiceCardText('Foguete');
+
+function isArietePhoneticLike(value) {
+    const compact = normalizeLooseText(value || '').replace(/\s+/g, '');
+    if (!compact) return false;
+    return compact.includes('ariete')
+        || compact.includes('arient')
+        || compact.includes('arete')
+        || compact.includes('arite')
+        || compact.includes('kariete')
+        || compact.includes('caliente')
+        || compact.includes('cariente')
+        || compact.includes('cariete')
+        || compact.includes('aliete')
+        || compact.includes('aride')
+        || compact.includes('aridi');
+}
+
+function isPirotecnicaPhoneticLike(value) {
+    const compact = normalizeLooseText(value || '').replace(/\s+/g, '');
+    if (!compact) return false;
+    return compact.includes('pirotec')
+        || compact.includes('piroteq')
+        || compact.includes('pirotek')
+        || compact.includes('pirotequi')
+        || compact.includes('piroten')
+        || compact.includes('pirotecnia')
+        || compact.includes('fogueteira')
+        || compact.includes('foguetera')
+        || compact.includes('fogos');
+}
+
+function getPriorityVoiceCardKey(value) {
+    if (isArietePhoneticLike(value)) return VOICE_PRIORITY_CARD_KEY_ARIETE;
+    if (isPirotecnicaPhoneticLike(value)) return VOICE_PRIORITY_CARD_KEY_PIROTECNICA;
+    return '';
 }
 
 const VOICE_PARSER_NOISE_TOKENS = new Set([
@@ -3832,7 +3986,6 @@ class VoiceCoordinator {
                     }
                 }
             }
-
             const evaluation = group
                 ? this.evaluateCandidate(group, event, {
                     ...command,
@@ -4017,8 +4170,9 @@ function updateVoiceUI(mode, message, transcript) {
     }
 
     const micPct = Math.max(0, Math.min(99, Math.round((state.voice.lastMicLevel || 0) * 1800)));
+    const micGain = Math.max(0.5, Math.min(4, Number.isFinite(state.voice.currentMicGain) ? state.voice.currentMicGain : 1));
     const lagMs = Math.max(0, Math.round(state.voice.lastRecognitionLagMs || 0));
-    const debugText = `motor:${state.voice.engine || 'n/a'} | plataforma:${state.voice.platform || 'n/a'} | browser:${state.voice.browserActive ? 'on' : 'off'} | native:${state.voice.nativeActive ? 'on' : 'off'} | whisper:${state.voice.whisperActive ? 'on' : 'off'} | whisperAlt:${state.voice.whisperAltActive ? 'on' : 'off'} | socket:${state.voice.socketState} | mic:${micPct}% | lag:${lagMs}ms | chunks:${state.voice.chunksSent} | ia:${state.voice.transcriptsReceived}`;
+    const debugText = `motor:${state.voice.engine || 'n/a'} | plataforma:${state.voice.platform || 'n/a'} | browser:${state.voice.browserActive ? 'on' : 'off'} | native:${state.voice.nativeActive ? 'on' : 'off'} | whisper:${state.voice.whisperActive ? 'on' : 'off'} | whisperAlt:${state.voice.whisperAltActive ? 'on' : 'off'} | socket:${state.voice.socketState} | mic:${micPct}% | ganho:${micGain.toFixed(2)}x | lag:${lagMs}ms | chunks:${state.voice.chunksSent} | ia:${state.voice.transcriptsReceived}`;
     els.voiceTranscript.textContent = state.voice.lastTranscript
         ? `${state.voice.lastTranscript}\n${debugText}`
         : debugText;
@@ -4283,6 +4437,13 @@ function scoreVoiceCandidate(inputNormalized, cardName) {
         score -= 0.1;
     }
 
+    const priorityKey = getPriorityVoiceCardKey(input);
+    if (priorityKey && cardNorm === priorityKey) {
+        score = Math.max(score, 0.94);
+    } else if (priorityKey === VOICE_PRIORITY_CARD_KEY_PIROTECNICA && cardNorm === VOICE_PRIORITY_CARD_KEY_FOGUETE) {
+        score -= 0.3;
+    }
+
     return Math.max(0, Math.min(1, score));
 }
 
@@ -4380,6 +4541,14 @@ function getBestGlobalVoiceCardMatch(cardText, options = {}) {
     // Never match Espelho via global fuzzy matching
     const pool = ALL_CARDS.filter(c => normalizeCardName(c.name) !== normalizeCardName('Espelho'));
 
+    const priorityCardKey = getPriorityVoiceCardKey(cardText || normalizedInput);
+    if (priorityCardKey) {
+        const hintedCard = pool.find(card => normalizeVoiceCardText(card.name) === priorityCardKey);
+        if (hintedCard) {
+            return { card: hintedCard, confidence: 0.99, inferred: false, reason: 'priority_phonetic_hint' };
+        }
+    }
+
     const exact = pool.find(card => normalizeVoiceCardText(card.name) === normalizedInput);
     if (exact) return { card: exact, confidence: 1, inferred: false };
 
@@ -4411,6 +4580,14 @@ function getBestVoiceCardMatch(cardText, cost, options = {}) {
 
     const normalizedInput = normalizeVoiceCardText(cardText);
     if (!normalizedInput) return null;
+
+    const priorityCardKey = getPriorityVoiceCardKey(cardText || normalizedInput);
+    if (priorityCardKey) {
+        const hintedCard = candidates.find(card => normalizeVoiceCardText(card.name) === priorityCardKey);
+        if (hintedCard) {
+            return { card: hintedCard, confidence: 0.99, inferred: false, reason: 'priority_phonetic_hint' };
+        }
+    }
 
     const aliasExact = candidates.find(card => normalizeVoiceCardText(card.name) === normalizedInput);
     if (aliasExact) {
@@ -5473,6 +5650,11 @@ let isRecordingWord = false;
 let vadFrameId;
 const VOICE_SILENCE_MS = 110;
 const VOICE_RMS_THRESHOLD = 0.00105;
+const VOICE_AGC_TARGET_RMS = 0.017;
+const VOICE_AGC_MIN_GAIN = 0.95;
+const VOICE_AGC_MAX_GAIN = 3.1;
+const VOICE_AGC_ATTACK_SMOOTHING = 0.22;
+const VOICE_AGC_RELEASE_SMOOTHING = 0.08;
 const WHISPER_FALLBACK_MS = 700;
 const WHISPER_PENDING_LIMIT = 8;
 let whisperFallbackTimer;
@@ -6008,6 +6190,7 @@ function stopAllAudio() {
     voiceGainNode = null;
     audioContext = null;
     state.voice.lastMicLevel = 0;
+    state.voice.currentMicGain = 1;
     state.voice.lastRecognitionLagMs = 0;
     state.voice.lastSpeechStartedAt = 0;
     state.voice.whisperActive = false;
@@ -6048,10 +6231,26 @@ const VOICE_CHROME_PRIORITY_HINTS = [
     'k 3',
     'ariete',
     'ariete de batalha',
+    'ariente',
+    'ariente de batalha',
+    'aliete',
     '4 ariete',
+    '4 ariente',
+    '4 aliete',
     '4 ariete de batalha',
     'caliente',
     '4 caliente',
+    'pirotecnica',
+    '3 pirotecnica',
+    'piro tecnica',
+    'pro tecnica',
+    'pirotequina',
+    'pirotequinica',
+    'piro tenica',
+    'pirotekinica',
+    'pirotecnia',
+    'fogueteira',
+    '3 fogueteira',
     'veneno',
     'vacuo',
     'x besta',
@@ -6241,10 +6440,16 @@ function scoreBrowserRecognitionAlternative(alternative, resultIndex, isFinal) {
             score -= 0.18;
         }
     }
-    if (normalizedTranscript.includes('ariete') || normalizedTranscript.includes('caliente')) {
-        const resolvedCard = normalizeVoiceCardText(command && command.cardText);
-        if (resolvedCard && resolvedCard.includes('ariete')) {
-            score += 0.22;
+    const resolvedCard = normalizeVoiceCardText(command && command.cardText);
+    const priorityCardKey = getPriorityVoiceCardKey(normalizedTranscript);
+    if (priorityCardKey) {
+        if (resolvedCard === priorityCardKey) {
+            score += 0.34;
+        } else if (priorityCardKey === VOICE_PRIORITY_CARD_KEY_PIROTECNICA && resolvedCard === VOICE_PRIORITY_CARD_KEY_FOGUETE) {
+            // Evita "foguete" ganhar quando a fala veio de "fogueteira"/"pirotecnica".
+            score -= 0.16;
+        } else if (resolvedCard) {
+            score -= 0.04;
         }
     }
     if (commandClass === 'unknown') {
@@ -6458,6 +6663,30 @@ function switchToBrowserFallback(reason) {
     startBrowserRecognition();
 }
 
+function updateAdaptiveMicGain(rms, noiseFloor) {
+    if (!voiceGainNode || !audioContext) return;
+    const currentGain = Number.isFinite(voiceGainNode.gain.value) ? voiceGainNode.gain.value : 1.1;
+    const speechGate = Math.max(noiseFloor * 1.04, VOICE_RMS_THRESHOLD * 0.58);
+    const speechLike = Number.isFinite(rms) && rms >= speechGate;
+    const safeRms = Math.max(rms || 0, 0.00035);
+    let targetGain = speechLike
+        ? (VOICE_AGC_TARGET_RMS / safeRms)
+        : 1.1;
+
+    if (!speechLike && safeRms < noiseFloor * 1.1) {
+        // In silence/noise, avoid pumping the background.
+        targetGain = Math.min(targetGain, currentGain);
+    }
+
+    targetGain = Math.max(VOICE_AGC_MIN_GAIN, Math.min(VOICE_AGC_MAX_GAIN, targetGain));
+    const smoothing = targetGain > currentGain ? VOICE_AGC_ATTACK_SMOOTHING : VOICE_AGC_RELEASE_SMOOTHING;
+    const nextGain = currentGain + ((targetGain - currentGain) * smoothing);
+    const now = audioContext.currentTime;
+    voiceGainNode.gain.cancelScheduledValues(now);
+    voiceGainNode.gain.setTargetAtTime(nextGain, now, speechLike ? 0.025 : 0.06);
+    state.voice.currentMicGain = nextGain;
+}
+
 function startSpeechRecording(speechStartedAt = Date.now()) {
     if (!mediaRecorder || state.voice.manuallyStopped || !state.voice.listening) return;
     if (whisperActiveUtterance) return;
@@ -6543,8 +6772,8 @@ async function startVADRecording() {
             audio: {
                 channelCount: 1,
                 echoCancellation: true,
-                noiseSuppression: false,
-                autoGainControl: false,
+                noiseSuppression: true,
+                autoGainControl: true,
                 sampleRate: 48000,
                 sampleSize: 16,
             },
@@ -6572,14 +6801,15 @@ async function startVADRecording() {
             voiceLowpassFilter.Q.value = 0.7;
 
             voiceCompressor = audioContext.createDynamicsCompressor();
-            voiceCompressor.threshold.value = -24;
-            voiceCompressor.knee.value = 12;
-            voiceCompressor.ratio.value = 4.5;
-            voiceCompressor.attack.value = 0.004;
-            voiceCompressor.release.value = 0.12;
+            voiceCompressor.threshold.value = -25;
+            voiceCompressor.knee.value = 10;
+            voiceCompressor.ratio.value = 3.8;
+            voiceCompressor.attack.value = 0.003;
+            voiceCompressor.release.value = 0.11;
 
             voiceGainNode = audioContext.createGain();
-            voiceGainNode.gain.value = 1.12;
+            voiceGainNode.gain.value = 1.18;
+            state.voice.currentMicGain = voiceGainNode.gain.value;
 
             microphone.connect(voiceHighpassFilter);
             voiceHighpassFilter.connect(voiceLowpassFilter);
@@ -6644,6 +6874,7 @@ async function startVADRecording() {
             if (!isRecordingWord) {
                 noiseFloor = (noiseFloor * 0.92) + (Math.min(rms, VOICE_RMS_THRESHOLD) * 0.08);
             }
+            updateAdaptiveMicGain(rms, noiseFloor);
             const speechThreshold = Math.max(VOICE_RMS_THRESHOLD * 0.68, noiseFloor * 1.025);
 
             if (rms >= speechThreshold) {
@@ -6745,6 +6976,7 @@ async function toggleVoiceListening() {
     state.voice.transcriptsReceived = 0;
     state.voice.lastTranscript = '';
     state.voice.lastMicLevel = 0;
+    state.voice.currentMicGain = 1;
     state.voice.lastRecognitionLagMs = 0;
     state.voice.lastAcceptedText = '';
     state.voice.lastAcceptedCost = null;

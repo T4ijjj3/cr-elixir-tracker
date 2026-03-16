@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import logging
 import os
 import re
 import sys
@@ -21,6 +22,62 @@ except ImportError:
 
 BASE_DIR = Path(__file__).resolve().parent
 CARDS_DB_PATH = BASE_DIR / "cards_db.js"
+LOG_DIR = BASE_DIR / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+LISTEN_LOG_FILE = Path(os.getenv("CR_LISTEN_LOG_FILE", str(LOG_DIR / "listen_server.log")))
+LISTEN_LOG_LEVEL = os.getenv("CR_LISTEN_LOG_LEVEL", "INFO").strip().upper()
+
+
+def configure_logging():
+    logger = logging.getLogger("listen_server")
+    if logger.handlers:
+        return logger
+    logger.setLevel(getattr(logging, LISTEN_LOG_LEVEL, logging.INFO))
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+    file_handler = logging.FileHandler(LISTEN_LOG_FILE, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+    logger.addHandler(file_handler)
+    logger.propagate = False
+    return logger
+
+
+LOGGER = configure_logging()
+
+
+def sanitize_log_value(value):
+    if isinstance(value, (list, tuple, set)):
+        return [sanitize_log_value(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): sanitize_log_value(v) for k, v in value.items()}
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, float):
+        return round(value, 4)
+    if value is None or isinstance(value, (int, bool)):
+        return value
+    text = str(value).replace("\n", " ").strip()
+    if len(text) > 300:
+        text = f"{text[:297]}..."
+    return text
+
+
+def log_event(event, level="info", **fields):
+    payload = {
+        "event": event,
+        **{k: sanitize_log_value(v) for k, v in fields.items()},
+    }
+    message = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    if level == "debug":
+        LOGGER.debug(message)
+    elif level == "warning":
+        LOGGER.warning(message)
+    elif level == "error":
+        LOGGER.error(message)
+    else:
+        LOGGER.info(message)
 
 
 def env_int(name, default, min_value=None, max_value=None):
@@ -153,13 +210,17 @@ TRANSCRIPT_FIXUPS = [
     (r"\bquei\b", "k"),
 ]
 
-print("=========================================================")
-print("🤖 IA do Whisper - MODO TURBO E MULTI-TAREFA (NOVA VERSAO)")
-print("=========================================================")
-print(
-    f"Perfil: low_latency={'on' if LOW_LATENCY_MODE else 'off'} | "
-    f"ram_total={SYSTEM_RAM_GB}GB | ram_target={TARGET_RAM_GB}GB | "
-    f"cpu_threads={CPU_THREADS} | workers={WHISPER_NUM_WORKERS}"
+LOGGER.info("=========================================================")
+LOGGER.info("🤖 IA do Whisper - MODO TURBO E MULTI-TAREFA (NOVA VERSAO)")
+LOGGER.info("=========================================================")
+log_event(
+    "server_profile",
+    low_latency=LOW_LATENCY_MODE,
+    ram_total_gb=SYSTEM_RAM_GB,
+    ram_target_gb=TARGET_RAM_GB,
+    cpu_threads=CPU_THREADS,
+    workers=WHISPER_NUM_WORKERS,
+    log_file=str(LISTEN_LOG_FILE),
 )
 
 
@@ -309,9 +370,14 @@ def carregar_modelo(device, model_candidates, compute_candidates, label="princip
     for model_name in model_candidates:
         for compute_type in compute_candidates:
             try:
-                print(
-                    f"Tentando [{label}] modelo={model_name} | device={device.upper()} | "
-                    f"compute={compute_type} | cpu_threads={CPU_THREADS} | workers={WHISPER_NUM_WORKERS}"
+                log_event(
+                    "model_load_attempt",
+                    label=label,
+                    model=model_name,
+                    device=device.upper(),
+                    compute=compute_type,
+                    cpu_threads=CPU_THREADS,
+                    workers=WHISPER_NUM_WORKERS,
                 )
                 model = WhisperModel(
                     model_name,
@@ -320,11 +386,23 @@ def carregar_modelo(device, model_candidates, compute_candidates, label="princip
                     cpu_threads=CPU_THREADS,
                     num_workers=WHISPER_NUM_WORKERS,
                 )
+                log_event(
+                    "model_load_ok",
+                    label=label,
+                    model=model_name,
+                    device=device.upper(),
+                    compute=compute_type,
+                )
                 return model_name, compute_type, model
             except Exception as exc:  # noqa: BLE001
                 ultimo_erro = exc
-                print(
-                    f"⚠️ Falha ao carregar [{label}] modelo={model_name} compute={compute_type}: {exc}"
+                log_event(
+                    "model_load_failed",
+                    level="warning",
+                    label=label,
+                    model=model_name,
+                    compute=compute_type,
+                    error=str(exc),
                 )
 
     raise RuntimeError(f"Nao consegui carregar nenhum modelo Whisper ({ultimo_erro}).")
@@ -404,7 +482,7 @@ def carregar_backends(device):
         default_alt_enabled = True
     alt_enabled = env_bool("CR_WHISPER_ALT_ENABLED", default_alt_enabled)
     if not alt_enabled:
-        print("ℹ️ Engine alternativo desativado (CR_WHISPER_ALT_ENABLED=0).")
+        log_event("alt_engine_disabled", reason="CR_WHISPER_ALT_ENABLED=0")
         return [primary_backend]
 
     try:
@@ -422,9 +500,12 @@ def carregar_backends(device):
             "rescue",
         )
     except Exception as exc:  # noqa: BLE001
-        print(
-            "⚠️ Nao consegui subir um segundo modelo dedicado; "
-            f"vou reutilizar o modelo principal com decodificacao alternativa. Motivo: {exc}"
+        log_event(
+            "alt_engine_fallback_shared_model",
+            level="warning",
+            reason=str(exc),
+            shared_from=primary_model_name,
+            compute_type=primary_compute_type,
         )
         alt_backend = criar_backend(
             "whisper_alt",
@@ -442,12 +523,17 @@ def carregar_backends(device):
 device = descobrir_device()
 ASR_BACKENDS = carregar_backends(device)
 for backend in ASR_BACKENDS:
-    shared_suffix = " | shared_model=1" if backend.shared_model else ""
-    print(
-        f"Acelerador: {device.upper()} | Engine: {backend.engine} | Precisao: {backend.compute_type} | "
-        f"Modelo: {backend.model_name} | Perfil: {backend.decode_profile}{shared_suffix}"
+    log_event(
+        "backend_ready",
+        device=device.upper(),
+        engine=backend.engine,
+        compute=backend.compute_type,
+        model=backend.model_name,
+        profile=backend.decode_profile,
+        shared_model=backend.shared_model,
+        partial_enabled=backend.partial_enabled,
     )
-print("✅ Backends carregados. Aguardando conexao na porta 8765...")
+log_event("backends_loaded", websocket_host="localhost", websocket_port=8765, backend_count=len(ASR_BACKENDS))
 
 
 def normalizar_transcricao_clash(texto):
@@ -519,6 +605,11 @@ class UtteranceState:
     partial_inflight: set = field(default_factory=set)
     last_partial_sent_at: dict = field(default_factory=dict)
     finals_sent: set = field(default_factory=set)
+    created_at_ms: int = 0
+    first_chunk_at_ms: int = 0
+    last_chunk_at_ms: int = 0
+    bytes_received: int = 0
+    decode_time_ms: dict = field(default_factory=dict)
 
 
 def build_server_ready_payload():
@@ -564,6 +655,25 @@ def build_voice_event(utterance, backend, phase, transcript):
     }
 
 
+def build_utterance_summary(utterance, closed_at_ms):
+    started_at = utterance.speech_started_at or utterance.created_at_ms or 0
+    speech_to_close_ms = max(0, closed_at_ms - started_at) if started_at else None
+    capture_window_ms = None
+    if utterance.first_chunk_at_ms and utterance.last_chunk_at_ms:
+        capture_window_ms = max(0, utterance.last_chunk_at_ms - utterance.first_chunk_at_ms)
+    return {
+        "utteranceId": utterance.utterance_id,
+        "platform": utterance.platform,
+        "chunks": utterance.chunk_count,
+        "bytes": utterance.bytes_received or len(utterance.audio_bytes),
+        "speechToCloseMs": speech_to_close_ms,
+        "captureWindowMs": capture_window_ms,
+        "decodeMsByEngine": utterance.decode_time_ms,
+        "partialsByEngine": list(utterance.partial_texts.keys()),
+        "finalsByEngine": list(utterance.finals_sent),
+    }
+
+
 async def emit_voice_event(websocket, utterance, backend, phase, transcript):
     if not transcript:
         return
@@ -588,20 +698,53 @@ async def maybe_emit_partial_for_backend(websocket, utterance, backend):
     utterance.partial_inflight.add(backend.engine)
 
     async def run_partial():
+        decode_started = time.perf_counter()
         try:
             transcript = await asyncio.to_thread(processar_audio_bytes, snapshot, mime_type, backend)
+            decode_ms = int((time.perf_counter() - decode_started) * 1000)
+            utterance.decode_time_ms[backend.engine] = utterance.decode_time_ms.get(backend.engine, 0) + decode_ms
             if not transcript:
+                log_event(
+                    "partial_skip_empty",
+                    level="debug",
+                    engine=backend.engine,
+                    utterance_id=utterance.utterance_id,
+                    decode_ms=decode_ms,
+                    chunks=utterance.chunk_count,
+                    bytes=len(snapshot),
+                )
                 return
             if transcript == utterance.partial_texts.get(backend.engine) or backend.engine in utterance.finals_sent:
+                log_event(
+                    "partial_skip_duplicate",
+                    level="debug",
+                    engine=backend.engine,
+                    utterance_id=utterance.utterance_id,
+                    decode_ms=decode_ms,
+                )
                 return
             utterance.partial_texts[backend.engine] = transcript
             utterance.last_partial_sent_at[backend.engine] = time.monotonic()
-            print(f"🎤 [IA Parcial {backend.engine} {utterance.utterance_id}]: {transcript}")
+            log_event(
+                "partial_sent",
+                engine=backend.engine,
+                utterance_id=utterance.utterance_id,
+                decode_ms=decode_ms,
+                chunks=utterance.chunk_count,
+                bytes=len(snapshot),
+                text=transcript,
+            )
             await emit_voice_event(websocket, utterance, backend, "partial", transcript)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
-            print(f"⚠️ Erro ao gerar parcial {backend.engine} {utterance.utterance_id}: {exc}")
+            log_event(
+                "partial_error",
+                level="warning",
+                engine=backend.engine,
+                utterance_id=utterance.utterance_id,
+                error=str(exc),
+            )
         finally:
             utterance.partial_inflight.discard(backend.engine)
             utterance.partial_tasks.pop(backend.engine, None)
@@ -629,6 +772,12 @@ async def finalizar_utterance(websocket, utterance):
             await task
 
     if not utterance.audio_bytes:
+        log_event(
+            "utterance_skip_empty",
+            utterance_id=utterance.utterance_id,
+            chunks=utterance.chunk_count,
+            platform=utterance.platform,
+        )
         return
 
     snapshot = bytes(utterance.audio_bytes)
@@ -637,32 +786,65 @@ async def finalizar_utterance(websocket, utterance):
         if backend.engine in utterance.finals_sent:
             return
         utterance.finals_sent.add(backend.engine)
+        decode_started = time.perf_counter()
         transcript = await asyncio.to_thread(
             processar_audio_bytes,
             snapshot,
             utterance.mime_type,
             backend,
         )
+        decode_ms = int((time.perf_counter() - decode_started) * 1000)
+        utterance.decode_time_ms[backend.engine] = utterance.decode_time_ms.get(backend.engine, 0) + decode_ms
         if transcript:
-            print(f"🎤 [IA Final {backend.engine} {utterance.utterance_id}]: {transcript}")
+            log_event(
+                "final_sent",
+                engine=backend.engine,
+                utterance_id=utterance.utterance_id,
+                decode_ms=decode_ms,
+                chunks=utterance.chunk_count,
+                bytes=len(snapshot),
+                text=transcript,
+            )
             await emit_voice_event(websocket, utterance, backend, "final", transcript)
+        else:
+            log_event(
+                "final_empty",
+                level="debug",
+                engine=backend.engine,
+                utterance_id=utterance.utterance_id,
+                decode_ms=decode_ms,
+                chunks=utterance.chunk_count,
+                bytes=len(snapshot),
+            )
 
     await asyncio.gather(*(run_final(backend) for backend in ASR_BACKENDS))
+    closed_at_ms = int(time.time() * 1000)
+    log_event("utterance_closed", **build_utterance_summary(utterance, closed_at_ms))
 
 
 async def recognize_audio(websocket):
-    print("🔥 Nova conexao estabelecida com o Rastreador!")
+    remote = str(getattr(websocket, "remote_address", "unknown"))
+    conn_id = f"ws-{int(time.time() * 1000)}-{id(websocket)}"
+    log_event("ws_connected", conn_id=conn_id, remote=remote)
     utterances = {}
     await websocket.send(json.dumps(build_server_ready_payload(), ensure_ascii=False))
+    log_event("server_ready_sent", conn_id=conn_id, engines=[backend.engine for backend in ASR_BACKENDS])
 
     try:
         async for message in websocket:
             if not isinstance(message, str):
+                log_event("ws_skip_non_text_message", level="debug", conn_id=conn_id)
                 continue
 
             try:
                 payload = json.loads(message)
             except json.JSONDecodeError:
+                log_event(
+                    "ws_invalid_json",
+                    level="warning",
+                    conn_id=conn_id,
+                    sample=message[:180],
+                )
                 continue
 
             msg_type = payload.get("type")
@@ -670,16 +852,27 @@ async def recognize_audio(websocket):
 
             if msg_type == "start_utterance":
                 if not utterance_id:
+                    log_event("start_utterance_missing_id", level="warning", conn_id=conn_id)
                     continue
+                now_ms = int(time.time() * 1000)
                 utterances[utterance_id] = UtteranceState(
                     utterance_id=utterance_id,
                     speech_started_at=int(payload.get("speechStartedAt") or 0),
                     platform=payload.get("platform") or "desktop",
+                    created_at_ms=now_ms,
+                )
+                log_event(
+                    "utterance_started",
+                    conn_id=conn_id,
+                    utterance_id=utterance_id,
+                    platform=utterances[utterance_id].platform,
+                    speech_started_at=utterances[utterance_id].speech_started_at,
                 )
                 continue
 
             if msg_type == "audio_chunk":
                 if not utterance_id:
+                    log_event("audio_chunk_missing_id", level="warning", conn_id=conn_id)
                     continue
                 utterance = utterances.setdefault(
                     utterance_id,
@@ -687,40 +880,89 @@ async def recognize_audio(websocket):
                         utterance_id=utterance_id,
                         speech_started_at=int(payload.get("speechStartedAt") or 0),
                         platform=payload.get("platform") or "desktop",
+                        created_at_ms=int(time.time() * 1000),
                     ),
                 )
                 try:
                     chunk = base64.b64decode(payload.get("audioBase64") or "", validate=False)
-                except Exception:
+                except Exception as exc:
+                    log_event(
+                        "audio_chunk_decode_error",
+                        level="warning",
+                        conn_id=conn_id,
+                        utterance_id=utterance_id,
+                        error=str(exc),
+                    )
                     chunk = b""
                 if not chunk:
+                    log_event(
+                        "audio_chunk_empty",
+                        level="debug",
+                        conn_id=conn_id,
+                        utterance_id=utterance_id,
+                    )
                     continue
                 utterance.mime_type = payload.get("mimeType") or utterance.mime_type
                 utterance.seq = max(utterance.seq, int(payload.get("seq") or 0))
                 utterance.chunk_count += 1
                 utterance.audio_bytes.extend(chunk)
+                chunk_now_ms = int(time.time() * 1000)
+                utterance.bytes_received += len(chunk)
+                if not utterance.first_chunk_at_ms:
+                    utterance.first_chunk_at_ms = chunk_now_ms
+                utterance.last_chunk_at_ms = chunk_now_ms
+                if utterance.chunk_count == 1 or utterance.chunk_count % 20 == 0:
+                    log_event(
+                        "audio_chunk_progress",
+                        level="debug",
+                        conn_id=conn_id,
+                        utterance_id=utterance_id,
+                        chunks=utterance.chunk_count,
+                        bytes=utterance.bytes_received,
+                        seq=utterance.seq,
+                        mime=utterance.mime_type,
+                    )
                 await maybe_emit_partial(websocket, utterance)
                 continue
 
             if msg_type == "end_utterance":
                 if not utterance_id:
+                    log_event("end_utterance_missing_id", level="warning", conn_id=conn_id)
                     continue
                 utterance = utterances.get(utterance_id)
                 if not utterance:
+                    log_event(
+                        "end_utterance_missing_state",
+                        level="warning",
+                        conn_id=conn_id,
+                        utterance_id=utterance_id,
+                    )
                     continue
                 await finalizar_utterance(websocket, utterance)
                 utterances.pop(utterance_id, None)
+                continue
+
+            if msg_type:
+                log_event("ws_message_unhandled", level="debug", conn_id=conn_id, type=msg_type)
     except websockets.exceptions.ConnectionClosed:
-        print("Conexao fechada pelo navegador.")
+        log_event("ws_closed", conn_id=conn_id, remote=remote)
+    except Exception as exc:  # noqa: BLE001
+        log_event("ws_loop_error", level="error", conn_id=conn_id, error=str(exc))
+        raise
     finally:
         for utterance in utterances.values():
             for task in utterance.partial_tasks.values():
                 if task and not task.done():
                     task.cancel()
+        log_event("ws_cleanup_done", conn_id=conn_id, pending_utterances=len(utterances))
 
 
 async def main():
-    async with websockets.serve(recognize_audio, "localhost", 8765, ping_interval=None):
+    host = os.getenv("CR_LISTEN_HOST", "localhost")
+    port = env_int("CR_LISTEN_PORT", 8765, min_value=1, max_value=65535)
+    log_event("ws_server_starting", host=host, port=port)
+    async with websockets.serve(recognize_audio, host, port, ping_interval=None):
+        log_event("ws_server_ready", host=host, port=port)
         await asyncio.Future()
 
 
