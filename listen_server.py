@@ -1,43 +1,63 @@
 import asyncio
 import base64
+import io
 import json
 import logging
 import os
 import re
+import ssl
 import sys
-import tempfile
 import threading
 import time
-from contextlib import suppress
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import websockets
 
 try:
     from faster_whisper import WhisperModel
+    from faster_whisper.audio import decode_audio
 except ImportError:
-    print("Erro: Bibliotecas nao encontradas.")
+    print("pip install faster-whisper websockets numpy")
     sys.exit(1)
+
+try:
+    from rapidfuzz import fuzz
+except Exception:  # noqa: BLE001
+    fuzz = None
+
 
 BASE_DIR = Path(__file__).resolve().parent
 CARDS_DB_PATH = BASE_DIR / "cards_db.js"
 LOG_DIR = BASE_DIR / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
+
 LISTEN_LOG_FILE = Path(os.getenv("CR_LISTEN_LOG_FILE", str(LOG_DIR / "listen_server.log")))
 LISTEN_LOG_LEVEL = os.getenv("CR_LISTEN_LOG_LEVEL", "INFO").strip().upper()
+LISTEN_TLS_MODE = os.getenv("CR_LISTEN_TLS", "auto").strip().lower()
+LISTEN_CERT_FILE_RAW = os.getenv("CR_LISTEN_CERT", "server.pem").strip()
+
+PROTOCOL_VERSION = "cr_voice_v3_pcm_canonical"
+SAMPLE_RATE = 16000
 
 
-def configure_logging():
+def configure_logging() -> logging.Logger:
     logger = logging.getLogger("listen_server")
     if logger.handlers:
         return logger
+
     logger.setLevel(getattr(logging, LISTEN_LOG_LEVEL, logging.INFO))
     formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(formatter)
+
     file_handler = logging.FileHandler(LISTEN_LOG_FILE, encoding="utf-8")
     file_handler.setFormatter(formatter)
+
     logger.addHandler(console_handler)
     logger.addHandler(file_handler)
     logger.propagate = False
@@ -47,44 +67,17 @@ def configure_logging():
 LOGGER = configure_logging()
 
 
-def sanitize_log_value(value):
-    if isinstance(value, (list, tuple, set)):
-        return [sanitize_log_value(v) for v in value]
-    if isinstance(value, dict):
-        return {str(k): sanitize_log_value(v) for k, v in value.items()}
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, float):
-        return round(value, 4)
-    if value is None or isinstance(value, (int, bool)):
-        return value
-    text = str(value).replace("\n", " ").strip()
-    if len(text) > 300:
-        text = f"{text[:297]}..."
-    return text
-
-
-def log_event(event, level="info", **fields):
-    payload = {
-        "event": event,
-        **{k: sanitize_log_value(v) for k, v in fields.items()},
-    }
+def log_event(event: str, level: str = "info", **fields) -> None:
+    payload = {"event": event, **fields}
     message = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-    if level == "debug":
-        LOGGER.debug(message)
-    elif level == "warning":
-        LOGGER.warning(message)
-    elif level == "error":
-        LOGGER.error(message)
-    else:
-        LOGGER.info(message)
+    getattr(LOGGER, level if level in {"debug", "info", "warning", "error"} else "info")(message)
 
 
-def env_int(name, default, min_value=None, max_value=None):
+def env_int(name: str, default: int, min_value: Optional[int] = None, max_value: Optional[int] = None) -> int:
     raw = os.getenv(name)
     try:
         value = int(raw) if raw is not None else int(default)
-    except (TypeError, ValueError):
+    except Exception:  # noqa: BLE001
         value = int(default)
     if min_value is not None:
         value = max(min_value, value)
@@ -93,206 +86,451 @@ def env_int(name, default, min_value=None, max_value=None):
     return value
 
 
-def env_float(name, default, min_value=None, max_value=None):
-    raw = os.getenv(name)
-    try:
-        value = float(raw) if raw is not None else float(default)
-    except (TypeError, ValueError):
-        value = float(default)
-    if min_value is not None:
-        value = max(min_value, value)
-    if max_value is not None:
-        value = min(max_value, value)
-    return value
-
-
-def env_bool(name, default=False):
-    raw = os.getenv(name)
-    if raw is None:
-        return bool(default)
-    return str(raw).strip().lower() in {"1", "true", "yes", "on", "y"}
-
-
-def detectar_ram_total_gb():
-    meminfo = Path("/proc/meminfo")
-    if not meminfo.exists():
-        return 0
-    try:
-        for line in meminfo.read_text(encoding="utf-8").splitlines():
-            if not line.startswith("MemTotal:"):
-                continue
-            parts = line.split()
-            if len(parts) < 2:
-                continue
-            kib = int(parts[1])
-            return max(0, int(round(kib / (1024 * 1024))))
-    except Exception:
-        return 0
-    return 0
-
-
-LOW_LATENCY_MODE = env_bool("CR_LOW_LATENCY_MODE", True)
-SYSTEM_RAM_GB = detectar_ram_total_gb()
-TARGET_RAM_GB = env_int("CR_WHISPER_TARGET_RAM_GB", 16, min_value=4, max_value=64)
-CPU_COUNT = max(2, os.cpu_count() or 4)
-CPU_THREADS = env_int("CR_WHISPER_CPU_THREADS", min(CPU_COUNT, 16), min_value=2, max_value=CPU_COUNT)
-WHISPER_NUM_WORKERS = env_int("CR_WHISPER_NUM_WORKERS", 1, min_value=1, max_value=4)
-PARTIAL_MIN_CHUNKS = env_int("CR_PARTIAL_MIN_CHUNKS", 1, min_value=1, max_value=6)
-PARTIAL_MIN_BYTES = env_int(
-    "CR_PARTIAL_MIN_BYTES",
-    2200 if LOW_LATENCY_MODE else 3200,
-    min_value=1200,
-    max_value=16000,
-)
-PARTIAL_MIN_INTERVAL_S = env_float(
-    "CR_PARTIAL_MIN_INTERVAL_S",
-    0.11 if LOW_LATENCY_MODE else 0.18,
-    min_value=0.05,
-    max_value=0.6,
-)
-PROTOCOL_VERSION = "triple_ensemble_v1"
-DEFAULT_MAX_NEW_TOKENS = env_int("CR_WHISPER_MAX_NEW_TOKENS", 18, min_value=8, max_value=32)
-LOCAL_PTBR_MODEL_DIRS = (
-    "models/distil-whisper-large-v3-ptbr-ct2",
-    "models/whisper-large-v3-ptbr-ct2",
-    "models/whisper-ptbr-ct2",
-)
-
-
-def carregar_cartas():
-    try:
-        source = CARDS_DB_PATH.read_text(encoding="utf-8")
-    except OSError:
-        return []
-
-    cards = re.findall(r"name:\s*'([^']+)'", source)
-    ordered = []
+def dedupe(values: List[str]) -> List[str]:
+    out: List[str] = []
     seen = set()
-    for card in cards:
-        if card in seen:
+    for value in values:
+        if not value or value in seen:
             continue
-        seen.add(card)
-        ordered.append(card)
-    return ordered
+        seen.add(value)
+        out.append(value)
+    return out
 
 
-CARD_NAMES = carregar_cartas()
-CARD_SAMPLE = ", ".join(CARD_NAMES[:140])
-CLASH_ROYALE_PROMPT = (
-    "Contexto: Clash Royale em portugues do Brasil. "
-    "O usuario costuma falar primeiro o custo de elixir e depois o nome da carta. "
-    "Atalhos por letra importantes: alfa=A, beta=B, celta=C, delta=D. "
-    "Habilidade de campeao: comando K seguido de numero (1, 2 ou 3). "
-    "Formato preferido: '<custo> <nome da carta>' com resposta curta. "
-    "Numeros validos: um, dois, tres, quatro, cinco, seis, sete, oito, nove, dez. "
-    "Se nao houver fala clara, prefira retornar vazio. "
-    f"Cartas possiveis: {CARD_SAMPLE}."
+def read_cards_db() -> str:
+    try:
+        return CARDS_DB_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def load_cards_and_costs() -> Tuple[List[str], Dict[str, int]]:
+    source = read_cards_db()
+    if not source:
+        return [], {}
+
+    pattern = re.compile(r"\{\s*name:\s*'([^']+)'\s*,\s*cost:\s*(\d+)", re.IGNORECASE)
+    rows = pattern.findall(source)
+
+    ordered_names: List[str] = []
+    costs: Dict[str, int] = {}
+    seen = set()
+
+    for name, cost_raw in rows:
+        if name not in seen:
+            ordered_names.append(name)
+            seen.add(name)
+        try:
+            costs[name] = int(cost_raw)
+        except ValueError:
+            continue
+
+    if ordered_names:
+        return ordered_names, costs
+
+    for name in re.findall(r"name:\s*'([^']+)'", source):
+        if name in seen:
+            continue
+        ordered_names.append(name)
+        seen.add(name)
+
+    return ordered_names, costs
+
+
+CARD_NAMES, CARD_COSTS = load_cards_and_costs()
+CARD_NAMES_BY_COST: Dict[int, List[str]] = {}
+for card_name, cost in CARD_COSTS.items():
+    CARD_NAMES_BY_COST.setdefault(cost, []).append(card_name)
+
+HOTWORD_LIMIT_DEFAULT = len(CARD_NAMES) if CARD_NAMES else 120
+HOTWORD_LIMIT = env_int(
+    "CR_WHISPER_HOTWORD_LIMIT",
+    HOTWORD_LIMIT_DEFAULT,
+    min_value=24,
+    max_value=max(64, HOTWORD_LIMIT_DEFAULT),
 )
-EXTRA_TRANSCRIPTION_CONTEXT = os.getenv("CR_WHISPER_PROMPT_EXTRA", "").strip()
-if EXTRA_TRANSCRIPTION_CONTEXT:
-    CLASH_ROYALE_PROMPT = f"{CLASH_ROYALE_PROMPT} {EXTRA_TRANSCRIPTION_CONTEXT}"
+CONTEXT_COST_CARD_LIMIT = env_int("CR_WHISPER_HINT_COST_LIMIT", 18, min_value=6, max_value=40)
+AUTO_VARIANT_TARGET = env_int("CR_VOICE_VARIANT_TARGET", 32, min_value=30, max_value=64)
+AUTO_TOKEN_VARIANT_TARGET = env_int("CR_VOICE_TOKEN_VARIANT_TARGET", 36, min_value=18, max_value=48)
+AUTO_PAIR_VARIANT_LIMIT = env_int("CR_VOICE_PAIR_VARIANT_LIMIT", 4, min_value=2, max_value=8)
+HOTWORD_VARIANTS_PER_CARD = env_int("CR_WHISPER_HOTWORDS_PER_CARD", 2, min_value=1, max_value=6)
+PRELOAD_MODEL_ON_BOOT = os.getenv("CR_WHISPER_PRELOAD_MODEL", "1").strip().lower() not in {"0", "false", "off", "no"}
 
-TRANSCRIPT_FIXUPS = [
+FIXUPS = [
     (r"\balpha\b", "alfa"),
     (r"\bbelta\b", "beta"),
     (r"\bbetta\b", "beta"),
-    (r"\bbetaa\b", "beta"),
     (r"\bselta\b", "celta"),
     (r"\bceta\b", "celta"),
-    (r"\bceltra\b", "celta"),
     (r"\bdeta\b", "delta"),
     (r"\bdeita\b", "delta"),
-    (r"\bdeltta\b", "delta"),
-    (r"\bdeltaa\b", "delta"),
     (r"\bka\b", "k"),
     (r"\bkay\b", "k"),
     (r"\bkei\b", "k"),
     (r"\bquei\b", "k"),
 ]
 
-LOGGER.info("=========================================================")
-LOGGER.info("🤖 IA do Whisper - MODO TURBO E MULTI-TAREFA (NOVA VERSAO)")
-LOGGER.info("=========================================================")
-log_event(
-    "server_profile",
-    low_latency=LOW_LATENCY_MODE,
-    ram_total_gb=SYSTEM_RAM_GB,
-    ram_target_gb=TARGET_RAM_GB,
-    cpu_threads=CPU_THREADS,
-    workers=WHISPER_NUM_WORKERS,
-    log_file=str(LISTEN_LOG_FILE),
-)
+NUM_WORDS = {
+    "zero": 0,
+    "0": 0,
+    "um": 1,
+    "uma": 1,
+    "1": 1,
+    "dois": 2,
+    "2": 2,
+    "tres": 3,
+    "três": 3,
+    "3": 3,
+    "quatro": 4,
+    "4": 4,
+    "cinco": 5,
+    "5": 5,
+    "seis": 6,
+    "6": 6,
+    "sete": 7,
+    "7": 7,
+    "oito": 8,
+    "8": 8,
+    "nove": 9,
+    "9": 9,
+    "dez": 10,
+    "10": 10,
+}
+
+STOP_WORDS = {"de", "da", "do", "das", "dos", "a", "o", "as", "os", "e"}
+VARIANT_STOP_WORDS = STOP_WORDS | {"com", "pra", "pro"}
+
+ARIETE_BATALHA_PHRASE_ALIASES = [
+    "ariete de batalha",
+    "ariete batalha",
+    "ariete da batalha",
+    "ariete de batala",
+    "ariete batalia",
+    "ariete bataria",
+    "ariete bataia",
+    "ariete baralha",
+    "arete de batalha",
+    "arete batalha",
+    "arete da batalha",
+    "arete de batala",
+    "arete batalia",
+    "arite de batalha",
+    "arite batalha",
+    "ariti de batalha",
+    "arieti de batalha",
+    "arieti batalha",
+    "ariente de batalha",
+    "ariente batalha",
+    "aliete de batalha",
+    "aliete batalha",
+    "ari ete de batalha",
+    "ari ete batalha",
+    "a riete de batalha",
+    "a riete batalha",
+    "cariete de batalha",
+    "cariete batalha",
+    "cariente de batalha",
+    "kariete de batalha",
+]
+
+ARIETE_BATALHA_SHORT_ALIASES = [
+    "ariete",
+    "battle ram",
+    "ram",
+    "arete",
+    "arite",
+    "arrete",
+    "arreter",
+    "arieti",
+    "ariet",
+    "a rede",
+    "caliente",
+    "caliente de batalha",
+    "cariente",
+    "cariete",
+    "cari eti",
+    "kariete",
+    "ari eti",
+    "arietee",
+    "ariente",
+    "aliete",
+    "aride batalha",
+    "aridi batalha",
+    "aridi de batalha",
+    "ariente de bataria",
+]
+
+CARD_ALIAS_OVERRIDES = {
+    "ariete de batalha": ARIETE_BATALHA_SHORT_ALIASES + ARIETE_BATALHA_PHRASE_ALIASES,
+    "pirotecnica": ["piro tecnica", "piro", "pirotecnia", "fogueteira", "foguetera"],
+    "x besta": ["xbesta", "xis besta", "besta"],
+    "p e k k a": ["pekka", "peka", "p e k a"],
+    "mini pekka": ["mini peka", "minipekka"],
+    "o tronco": ["tronco"],
+    "tres mosqueteiras": ["3 mosqueteiras", "tres mosqueteira"],
+}
 
 
-@dataclass
-class AsrBackend:
-    engine: str
-    model_name: str
-    compute_type: str
-    model: WhisperModel
-    decode_profile: str
-    beam_size: int = 1
-    best_of: int = 1
-    patience: float = 0.35
-    no_speech_threshold: float = 0.36
-    log_prob_threshold: float = -1.1
-    compression_ratio_threshold: float = 2.25
-    vad_parameters: dict = field(
-        default_factory=lambda: {
-            "min_silence_duration_ms": 170,
-            "speech_pad_ms": 110,
-        }
-    )
-    transcribe_lock: threading.Lock = field(default_factory=threading.Lock)
-    shared_model: bool = False
-    partial_enabled: bool = True
-    max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS
-    hotwords: str = ""
+def apply_token_mutators(token: str) -> List[str]:
+    candidates = [
+        token.replace("qu", "k"),
+        token.replace("que", "ke"),
+        token.replace("qui", "ki"),
+        token.replace("ce", "se").replace("ci", "si"),
+        token.replace("ge", "je").replace("gi", "ji"),
+        token.replace("ch", "x"),
+        token.replace("x", "s"),
+        token.replace("x", "z"),
+        token.replace("lh", "li"),
+        token.replace("nh", "ni"),
+        token.replace("rr", "r"),
+        token.replace("ss", "s"),
+        re.sub(r"gu([ei])", r"g\1", token),
+        token.replace("v", "b"),
+        token.replace("b", "v"),
+        token.replace("d", "t"),
+        token.replace("t", "d"),
+        token.replace("ph", "f"),
+        token.replace("w", "v"),
+        token.replace("y", "i"),
+        token.replace("ca", "ka").replace("co", "ko").replace("cu", "ku"),
+        token.replace("z", "s"),
+        token.replace("s", "z"),
+        token.replace("ei", "e"),
+        token.replace("ou", "o"),
+        token.replace("ao", "aum"),
+        token.replace("l", "u"),
+        token.replace("r", "l"),
+        token.replace("l", "r"),
+        token.replace("c", "k"),
+        token.replace("g", "j"),
+    ]
+    return [candidate for candidate in candidates if candidate and candidate != token]
 
 
-def descobrir_device():
-    try:
-        import torch
+def apply_token_finishers(token: str) -> List[str]:
+    candidates = [
+        f"{token[:-1]}n" if token.endswith("m") else token,
+        f"{token[:-1]}u" if token.endswith("o") else token,
+        f"{token[:-1]}i" if token.endswith("e") else token,
+        token[:-1] if token.endswith("r") else token,
+        token[:-1] if token.endswith("s") else token,
+        f"{token}a" if len(token) <= 9 else token,
+        f"{token}e" if len(token) <= 9 else token,
+        f"{token}i" if len(token) <= 9 else token,
+        f"{token}o" if len(token) <= 9 else token,
+        f"{token}u" if len(token) <= 9 else token,
+        f"e{token}" if len(token) <= 9 else token,
+        f"i{token}" if len(token) <= 9 else token,
+        f"a{token}" if len(token) <= 9 else token,
+        token[:-1] if len(token) > 4 else token,
+        token[1:] if len(token) > 4 else token,
+        f"{token}{token[-1]}" if len(token) > 3 else token,
+    ]
+    return [candidate for candidate in candidates if candidate and candidate != token]
 
-        return "cuda" if torch.cuda.is_available() else "cpu"
-    except ImportError:
-        return "cpu"
+
+def strip_accents(value: str) -> str:
+    return "".join(ch for ch in unicodedata.normalize("NFD", value) if unicodedata.category(ch) != "Mn")
 
 
-def dedupe_valores(valores):
-    ordered = []
+def normalize_match_text(value: str) -> str:
+    text = strip_accents((value or "").lower())
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def normalize_transcript(value: str) -> str:
+    text = re.sub(r"\s+", " ", (value or "").strip().lower())
+    if not text:
+        return ""
+    for pattern, replacement in FIXUPS:
+        text = re.sub(pattern, replacement, text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def compact_words(value: str) -> str:
+    return " ".join(token for token in value.split() if token and token not in STOP_WORDS).strip()
+
+
+def add_phrase_forms(container: List[str], value: str) -> None:
+    normalized = normalize_match_text(value)
+    if len(normalized.replace(" ", "")) < 2:
+        return
+
+    container.append(normalized)
+
+    without_stops = " ".join(token for token in normalized.split() if token and token not in VARIANT_STOP_WORDS).strip()
+    if without_stops and without_stops != normalized:
+        container.append(without_stops)
+
+    compact_full = normalized.replace(" ", "")
+    if len(compact_full) >= 4:
+        container.append(compact_full)
+
+    compact_without_stops = without_stops.replace(" ", "")
+    if compact_without_stops and compact_without_stops != compact_full and len(compact_without_stops) >= 4:
+        container.append(compact_without_stops)
+
+
+def generate_token_variants(token: str, target: int = AUTO_TOKEN_VARIANT_TARGET) -> List[str]:
+    base = normalize_match_text(token).replace(" ", "")
+    if not base:
+        return []
+
+    ordered: List[str] = []
     seen = set()
-    for valor in valores:
-        if not valor or valor in seen:
+    queue: List[Tuple[str, int]] = [(base, 0)]
+
+    def push(value: str) -> bool:
+        normalized = normalize_match_text(value).replace(" ", "")
+        if len(normalized) < 2 or normalized in seen:
+            return False
+        seen.add(normalized)
+        ordered.append(normalized)
+        return True
+
+    push(base)
+    index = 0
+    while index < len(queue) and len(ordered) < target:
+        current, depth = queue[index]
+        index += 1
+        if depth >= 2:
             continue
-        seen.add(valor)
-        ordered.append(valor)
-    return ordered
+        for candidate in apply_token_mutators(current):
+            normalized = normalize_match_text(candidate).replace(" ", "")
+            if not normalized or normalized == current or normalized in seen:
+                continue
+            push(normalized)
+            queue.append((normalized, depth + 1))
+            if len(ordered) >= target:
+                break
+
+    finisher_inputs = ordered[: max(8, min(len(ordered), 12))] or [base]
+    for value in finisher_inputs:
+        for candidate in apply_token_finishers(value):
+            push(candidate)
+            if len(ordered) >= target:
+                return ordered[:target]
+
+    for value in list(ordered):
+        if len(ordered) >= target:
+            break
+        for candidate in apply_token_mutators(value):
+            for finished in apply_token_finishers(candidate):
+                push(finished)
+                if len(ordered) >= target:
+                    break
+            if len(ordered) >= target:
+                break
+
+    return ordered[:target]
 
 
-def modelos_locais_existentes(env_vars=(), relative_dirs=()):
-    candidates = []
+def build_auto_phrase_variants(card_name: str, target: int = AUTO_VARIANT_TARGET) -> List[str]:
+    base = normalize_match_text(card_name)
+    if not base:
+        return []
 
-    for env_var in env_vars:
-        value = os.getenv(env_var)
-        if not value:
+    tokens = [token for token in base.split() if token]
+    content_indices = [index for index, token in enumerate(tokens) if token not in VARIANT_STOP_WORDS]
+    if not content_indices:
+        content_indices = list(range(len(tokens)))
+
+    variants: List[str] = []
+    add_phrase_forms(variants, base)
+
+    content_tokens = [tokens[index] for index in content_indices]
+    if content_tokens:
+        add_phrase_forms(variants, " ".join(content_tokens))
+
+    token_variants = {index: generate_token_variants(tokens[index]) for index in content_indices}
+
+    for index in content_indices:
+        for variant in token_variants.get(index, []):
+            candidate_tokens = tokens[:]
+            candidate_tokens[index] = variant
+            add_phrase_forms(variants, " ".join(candidate_tokens))
+            if len(dedupe(variants)) >= target:
+                return dedupe(variants)[:target]
+
+    for left_pos, left_index in enumerate(content_indices):
+        left_variants = token_variants.get(left_index, [])[:AUTO_PAIR_VARIANT_LIMIT]
+        for right_index in content_indices[left_pos + 1 :]:
+            right_variants = token_variants.get(right_index, [])[:AUTO_PAIR_VARIANT_LIMIT]
+            for left_variant in left_variants:
+                for right_variant in right_variants:
+                    candidate_tokens = tokens[:]
+                    candidate_tokens[left_index] = left_variant
+                    candidate_tokens[right_index] = right_variant
+                    add_phrase_forms(variants, " ".join(candidate_tokens))
+                    if len(dedupe(variants)) >= target:
+                        return dedupe(variants)[:target]
+
+    return dedupe(variants)[:target]
+
+
+def build_card_variants(card_name: str) -> List[str]:
+    base = normalize_match_text(card_name)
+    if not base:
+        return []
+
+    compacted = compact_words(base)
+    variants: List[str] = []
+    add_phrase_forms(variants, base)
+    if compacted and compacted != base:
+        add_phrase_forms(variants, compacted)
+
+    if base.startswith("o "):
+        add_phrase_forms(variants, base[2:].strip())
+    if base.startswith("a "):
+        add_phrase_forms(variants, base[2:].strip())
+
+    for manual_variant in CARD_ALIAS_OVERRIDES.get(base, []):
+        add_phrase_forms(variants, manual_variant)
+
+    variants.extend(build_auto_phrase_variants(base))
+    return dedupe([variant.strip() for variant in variants if variant and len(variant.replace(" ", "")) >= 2])
+
+
+CARD_VARIANTS: Dict[str, List[str]] = {card_name: build_card_variants(card_name) for card_name in CARD_NAMES}
+
+
+def build_card_hotwords(card_name: str) -> List[str]:
+    base = normalize_match_text(card_name)
+    if not base:
+        return []
+
+    hotwords: List[str] = [base]
+    for manual_variant in CARD_ALIAS_OVERRIDES.get(base, []):
+        normalized = normalize_match_text(manual_variant)
+        if not normalized or normalized == base:
             continue
-        path = Path(value)
-        if not path.is_absolute():
-            path = BASE_DIR / value
-        if path.exists():
-            candidates.append(str(path.resolve()))
-
-    for relative_dir in relative_dirs:
-        path = BASE_DIR / relative_dir
-        if path.exists():
-            candidates.append(str(path.resolve()))
-
-    return dedupe_valores(candidates)
+        hotwords.append(normalized)
+        if len(dedupe(hotwords)) >= HOTWORD_VARIANTS_PER_CARD:
+            break
+    return dedupe(hotwords)[:HOTWORD_VARIANTS_PER_CARD]
 
 
-def construir_hotwords_clash():
-    default_limit = env_int("CR_WHISPER_HOTWORD_LIMIT", 96, min_value=24, max_value=max(24, len(CARD_NAMES) or 64))
+CARD_HOTWORDS: Dict[str, List[str]] = {card_name: build_card_hotwords(card_name) for card_name in CARD_NAMES}
+VARIANT_TO_CARD: Dict[str, str] = {}
+VARIANT_COLLISIONS = set()
+for card_name in CARD_NAMES:
+    for variant in CARD_VARIANTS.get(card_name, []):
+        existing = VARIANT_TO_CARD.get(variant)
+        if existing and existing != card_name:
+            VARIANT_COLLISIONS.add(variant)
+            VARIANT_TO_CARD.pop(variant, None)
+            continue
+        if variant in VARIANT_COLLISIONS:
+            continue
+        VARIANT_TO_CARD[variant] = card_name
+
+if VARIANT_COLLISIONS:
+    log_event("variant_collisions", level="warning", count=len(VARIANT_COLLISIONS))
+
+
+def build_global_hotwords() -> str:
     base_terms = [
         "clash royale",
         "alfa",
@@ -305,546 +543,450 @@ def construir_hotwords_clash():
         "k 2",
         "k 3",
     ]
+
+    card_terms: List[str] = []
+    for card_name in CARD_NAMES[:HOTWORD_LIMIT]:
+        card_terms.extend(CARD_HOTWORDS.get(card_name, [card_name]))
+
     env_terms = [term.strip() for term in os.getenv("CR_WHISPER_HOTWORDS", "").split(",") if term.strip()]
-    return ", ".join(dedupe_valores(base_terms + CARD_NAMES[:default_limit] + env_terms))
+    return ", ".join(dedupe(base_terms + card_terms + env_terms))
 
 
-CLASH_ROYALE_HOTWORDS = construir_hotwords_clash()
+GLOBAL_HOTWORDS = build_global_hotwords()
+BASE_PROMPT = (
+    "Clash Royale em portugues do Brasil. "
+    "Comando curto no formato '<custo> <carta>'. "
+    "Use nomes oficiais das cartas. "
+    "Se nao houver fala clara, retorne vazio."
+)
 
 
-def candidatos_compute_type_primario(device):
-    forced = os.getenv("CR_WHISPER_COMPUTE_TYPE")
-    if forced:
-        return [forced]
-    if device == "cuda":
-        return ["float16", "int8_float16", "int8"]
-    return ["int8", "int8_float32"]
-
-
-def candidatos_compute_type_alternativo(device, primary_compute_type):
-    forced = os.getenv("CR_WHISPER_ALT_COMPUTE_TYPE")
-    if forced:
-        return [forced]
-    if device == "cuda":
-        return dedupe_valores(["int8_float16", "int8", "float16", primary_compute_type])
-    return dedupe_valores(["int8_float32", "int8", primary_compute_type])
-
-
-def candidatos_modelo_primario(device):
-    forced = os.getenv("CR_WHISPER_MODEL")
-    if forced:
-        return [forced]
-    local_ptbr = modelos_locais_existentes(
-        env_vars=("CR_WHISPER_PTBR_MODEL", "CR_WHISPER_LOCAL_MODEL"),
-        relative_dirs=LOCAL_PTBR_MODEL_DIRS,
-    )
-    if device == "cuda":
-        return dedupe_valores(local_ptbr + ["large-v3-turbo", "medium", "small"])
-    preferir_modelo_forte_cpu = TARGET_RAM_GB >= 14 and SYSTEM_RAM_GB >= 14
-    if preferir_modelo_forte_cpu and local_ptbr:
-        return dedupe_valores(local_ptbr + ["small", "base"])
-    if LOW_LATENCY_MODE:
-        return dedupe_valores(["small", "base"] + local_ptbr)
-    return dedupe_valores(local_ptbr + ["small", "base"])
-
-
-def candidatos_modelo_alternativo(device, primary_model_name):
-    forced = os.getenv("CR_WHISPER_ALT_MODEL")
-    if forced:
-        return [forced]
-    local_alt = modelos_locais_existentes(
-        env_vars=("CR_WHISPER_ALT_LOCAL_MODEL",),
-        relative_dirs=LOCAL_PTBR_MODEL_DIRS,
-    )
-    local_alt = [candidate for candidate in local_alt if str(candidate) != str(primary_model_name)]
-    if device == "cuda":
-        return dedupe_valores(local_alt + ["small", "medium", primary_model_name, "base"])
-    if LOW_LATENCY_MODE:
-        return dedupe_valores(["base", "small"] + local_alt + [primary_model_name])
-    return dedupe_valores(local_alt + ["small", "base", primary_model_name])
-
-
-def carregar_modelo(device, model_candidates, compute_candidates, label="principal"):
-    ultimo_erro = None
-
-    for model_name in model_candidates:
-        for compute_type in compute_candidates:
-            try:
-                log_event(
-                    "model_load_attempt",
-                    label=label,
-                    model=model_name,
-                    device=device.upper(),
-                    compute=compute_type,
-                    cpu_threads=CPU_THREADS,
-                    workers=WHISPER_NUM_WORKERS,
-                )
-                model = WhisperModel(
-                    model_name,
-                    device=device,
-                    compute_type=compute_type,
-                    cpu_threads=CPU_THREADS,
-                    num_workers=WHISPER_NUM_WORKERS,
-                )
-                log_event(
-                    "model_load_ok",
-                    label=label,
-                    model=model_name,
-                    device=device.upper(),
-                    compute=compute_type,
-                )
-                return model_name, compute_type, model
-            except Exception as exc:  # noqa: BLE001
-                ultimo_erro = exc
-                log_event(
-                    "model_load_failed",
-                    level="warning",
-                    label=label,
-                    model=model_name,
-                    compute=compute_type,
-                    error=str(exc),
-                )
-
-    raise RuntimeError(f"Nao consegui carregar nenhum modelo Whisper ({ultimo_erro}).")
-
-
-def criar_backend(engine, model_name, compute_type, model, decode_profile, shared_model=False, transcribe_lock=None):
-    if decode_profile == "rescue":
-        beam_size = 2 if LOW_LATENCY_MODE else 3
-        best_of = 2 if LOW_LATENCY_MODE else 3
-        return AsrBackend(
-            engine=engine,
-            model_name=model_name,
-            compute_type=compute_type,
-            model=model,
-            decode_profile=decode_profile,
-            beam_size=beam_size,
-            best_of=best_of,
-            patience=0.85,
-            no_speech_threshold=0.40,
-            log_prob_threshold=-1.25,
-            compression_ratio_threshold=2.3,
-            vad_parameters={
-                "min_silence_duration_ms": 120 if LOW_LATENCY_MODE else 160,
-                "speech_pad_ms": 90 if LOW_LATENCY_MODE else 150,
-            },
-            transcribe_lock=transcribe_lock or threading.Lock(),
-            shared_model=shared_model,
-            partial_enabled=False,
-            max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
-            hotwords=CLASH_ROYALE_HOTWORDS,
-        )
-
-    return AsrBackend(
-        engine=engine,
-        model_name=model_name,
-        compute_type=compute_type,
-        model=model,
-        decode_profile=decode_profile,
-        beam_size=1,
-        best_of=1,
-        patience=0.35,
-        no_speech_threshold=0.36,
-        log_prob_threshold=-1.1,
-        compression_ratio_threshold=2.2,
-        vad_parameters={
-            "min_silence_duration_ms": 105 if LOW_LATENCY_MODE else 150,
-            "speech_pad_ms": 70 if LOW_LATENCY_MODE else 100,
-        },
-        transcribe_lock=transcribe_lock or threading.Lock(),
-        shared_model=shared_model,
-        max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
-        hotwords=CLASH_ROYALE_HOTWORDS,
-    )
-
-
-def carregar_backends(device):
-    primary_model_name, primary_compute_type, primary_model = carregar_modelo(
-        device,
-        candidatos_modelo_primario(device),
-        candidatos_compute_type_primario(device),
-        label="principal",
-    )
-    primary_backend = criar_backend(
-        "whisper",
-        primary_model_name,
-        primary_compute_type,
-        primary_model,
-        "precision",
-    )
-    if device == "cpu" and primary_model_name not in {"small", "base"}:
-        # Browser is the fast lane on CPU; heavy local models should correct finals,
-        # not consume CPU with partials and drag the end-to-end latency.
-        primary_backend.partial_enabled = False
-
-    default_alt_enabled = device == "cuda"
-    if not LOW_LATENCY_MODE:
-        default_alt_enabled = True
-    alt_enabled = env_bool("CR_WHISPER_ALT_ENABLED", default_alt_enabled)
-    if not alt_enabled:
-        log_event("alt_engine_disabled", reason="CR_WHISPER_ALT_ENABLED=0")
-        return [primary_backend]
-
+def parse_hint_cost(raw_value: object) -> Optional[int]:
     try:
-        alt_model_name, alt_compute_type, alt_model = carregar_modelo(
-            device,
-            candidatos_modelo_alternativo(device, primary_model_name),
-            candidatos_compute_type_alternativo(device, primary_compute_type),
-            label="alternativo",
-        )
-        alt_backend = criar_backend(
-            "whisper_alt",
-            alt_model_name,
-            alt_compute_type,
-            alt_model,
-            "rescue",
-        )
-    except Exception as exc:  # noqa: BLE001
-        log_event(
-            "alt_engine_fallback_shared_model",
-            level="warning",
-            reason=str(exc),
-            shared_from=primary_model_name,
-            compute_type=primary_compute_type,
-        )
-        alt_backend = criar_backend(
-            "whisper_alt",
-            primary_model_name,
-            primary_compute_type,
-            primary_model,
-            "rescue",
-            shared_model=True,
-            transcribe_lock=primary_backend.transcribe_lock,
-        )
-
-    return [primary_backend, alt_backend]
+        cost = int(raw_value)
+    except (TypeError, ValueError):
+        return None
+    if 0 <= cost <= 10:
+        return cost
+    return None
 
 
-device = descobrir_device()
-ASR_BACKENDS = carregar_backends(device)
-for backend in ASR_BACKENDS:
-    log_event(
-        "backend_ready",
-        device=device.upper(),
-        engine=backend.engine,
-        compute=backend.compute_type,
-        model=backend.model_name,
-        profile=backend.decode_profile,
-        shared_model=backend.shared_model,
-        partial_enabled=backend.partial_enabled,
+def build_decode_context(hint_cost: Optional[int]) -> Tuple[str, str]:
+    cost = parse_hint_cost(hint_cost)
+    if cost is None:
+        return BASE_PROMPT, GLOBAL_HOTWORDS
+
+    cost_cards = CARD_NAMES_BY_COST.get(cost, [])[:CONTEXT_COST_CARD_LIMIT]
+    if not cost_cards:
+        return BASE_PROMPT, GLOBAL_HOTWORDS
+
+    contextual_terms = [
+        "clash royale",
+        "alfa",
+        "beta",
+        "celta",
+        "delta",
+        "habilidade",
+        "campeao",
+        "k 1",
+        "k 2",
+        "k 3",
+        str(cost),
+    ]
+    for card_name in cost_cards:
+        contextual_terms.extend(CARD_HOTWORDS.get(card_name, [card_name]))
+
+    prompt = (
+        f"{BASE_PROMPT} "
+        f"Custo em foco: {cost}. Priorize cartas desse custo."
     )
-log_event("backends_loaded", websocket_host="localhost", websocket_port=8765, backend_count=len(ASR_BACKENDS))
+    return prompt, ", ".join(dedupe(contextual_terms))
 
 
-def normalizar_transcricao_clash(texto):
-    cleaned = re.sub(r"\s+", " ", (texto or "").strip().lower())
-    if not cleaned:
-        return ""
-    for pattern, replacement in TRANSCRIPT_FIXUPS:
-        cleaned = re.sub(pattern, replacement, cleaned)
-    return re.sub(r"\s+", " ", cleaned).strip()
+def parse_cost(text: str) -> Tuple[Optional[int], str]:
+    tokens = text.split()
+    for index, token in enumerate(tokens[:6]):
+        if token in NUM_WORDS:
+            return int(NUM_WORDS[token]), " ".join(tokens[index + 1 :]).strip()
+        if token.isdigit():
+            value = int(token)
+            if 0 <= value <= 10:
+                return value, " ".join(tokens[index + 1 :]).strip()
+    return None, text
 
 
-def suffix_for_mime(mime_type):
-    raw = (mime_type or "").lower()
-    if "ogg" in raw:
-        return ".ogg"
-    if "mp4" in raw or "aac" in raw:
-        return ".m4a"
-    return ".webm"
+def similarity_score(left: str, right: str) -> float:
+    if not left or not right:
+        return 0.0
+    if fuzz is not None:
+        return float(fuzz.WRatio(left, right))
+
+    import difflib
+
+    return float(difflib.SequenceMatcher(None, left, right).ratio() * 100.0)
 
 
-def processar_audio(caminho_arquivo, backend):
-    with backend.transcribe_lock:
-        segments, _ = backend.model.transcribe(
-            caminho_arquivo,
-            beam_size=backend.beam_size,
-            best_of=backend.best_of,
-            patience=backend.patience,
+def best_card(remainder_norm: str, candidates: List[str]) -> Tuple[Optional[str], float, float, str, str]:
+    if not remainder_norm:
+        return None, 0.0, 0.0, "", "empty"
+
+    exact = VARIANT_TO_CARD.get(remainder_norm)
+    if exact and exact in candidates:
+        return exact, 100.0, 0.0, remainder_norm, "exact_variant"
+
+    best_name: Optional[str] = None
+    best_score = 0.0
+    second_score = 0.0
+    best_variant = ""
+
+    for card_name in candidates:
+        card_best = 0.0
+        card_variant = ""
+        for variant in CARD_VARIANTS.get(card_name, [normalize_match_text(card_name)]):
+            score = similarity_score(remainder_norm, variant)
+            if score > card_best:
+                card_best = score
+                card_variant = variant
+        if card_best > best_score:
+            second_score = best_score
+            best_score = card_best
+            best_name = card_name
+            best_variant = card_variant
+        elif card_best > second_score:
+            second_score = card_best
+
+    method = "rapidfuzz" if fuzz is not None else "difflib"
+    rationale = f"{method} best={best_score:.1f} margin={best_score - second_score:.1f}"
+    return best_name, best_score, second_score, best_variant, rationale
+
+
+def should_accept_match(remainder_norm: str, score: float, margin: float, exact_variant: bool) -> bool:
+    if exact_variant:
+        return True
+    if not remainder_norm or len(remainder_norm) < 3:
+        return False
+
+    compact_len = len(remainder_norm.replace(" ", ""))
+    if score >= 95:
+        return True
+    if score >= 91 and margin >= 5:
+        return True
+    if score >= 88 and compact_len >= 7 and margin >= 8:
+        return True
+    if score >= 85 and compact_len >= 11 and margin >= 12:
+        return True
+    return False
+
+
+def canonicalize(raw_text: str, hint_cost: Optional[int] = None) -> Tuple[str, Optional[dict]]:
+    normalized = normalize_transcript(raw_text)
+    if not normalized:
+        return "", None
+
+    spoken_cost, remainder = parse_cost(normalized)
+    effective_cost = spoken_cost if spoken_cost is not None else parse_hint_cost(hint_cost)
+    effective_remainder = remainder if spoken_cost is not None else normalized
+    remainder_norm = normalize_match_text(effective_remainder)
+
+    candidates = CARD_NAMES
+    if effective_cost is not None and CARD_COSTS:
+        filtered = [card_name for card_name in CARD_NAMES if CARD_COSTS.get(card_name) == effective_cost]
+        if filtered:
+            candidates = filtered
+
+    match_name, score, second_score, matched_variant, rationale = best_card(remainder_norm, candidates)
+    margin = max(0.0, score - second_score)
+    accepted = bool(
+        match_name
+        and should_accept_match(
+            remainder_norm,
+            score,
+            margin,
+            exact_variant=(matched_variant == remainder_norm and score >= 100.0),
+        )
+    )
+
+    metadata = {
+        "raw": raw_text,
+        "normalized": normalized,
+        "cost": effective_cost,
+        "costSource": "spoken" if spoken_cost is not None else ("hint" if effective_cost is not None else None),
+        "remainder": effective_remainder,
+        "match": match_name,
+        "matchedVariant": matched_variant or None,
+        "score": round(score, 2),
+        "margin": round(margin, 2),
+        "rationale": rationale,
+        "accepted": accepted,
+    }
+
+    fallback_text = raw_text.strip() or normalized
+    if accepted and match_name and effective_cost is not None:
+        return f"{effective_cost} {match_name}", metadata
+    if accepted and match_name:
+        return match_name, metadata
+    return fallback_text, metadata
+
+
+def detect_device() -> str:
+    try:
+        import torch
+
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except ImportError:
+        return "cpu"
+
+
+DEVICE = detect_device()
+MODEL_NAME = os.getenv("CR_WHISPER_MODEL", "small")
+COMPUTE_TYPE = os.getenv("CR_WHISPER_COMPUTE_TYPE", "int8")
+CPU_COUNT = max(2, os.cpu_count() or 4)
+CPU_THREADS = env_int("CR_WHISPER_CPU_THREADS", CPU_COUNT, min_value=2, max_value=CPU_COUNT)
+NUM_WORKERS = env_int("CR_WHISPER_NUM_WORKERS", 1, min_value=1, max_value=4)
+MAX_NEW_TOKENS = env_int("CR_WHISPER_MAX_NEW_TOKENS", 12, min_value=8, max_value=32)
+
+MODEL: Optional[WhisperModel] = None
+MODEL_BOOT_LOCK = threading.Lock()
+TRANSCRIBE_LOCK = threading.Lock()
+
+
+def ensure_model_loaded() -> WhisperModel:
+    global MODEL
+    if MODEL is not None:
+        return MODEL
+
+    with MODEL_BOOT_LOCK:
+        if MODEL is None:
+            MODEL = WhisperModel(
+                MODEL_NAME,
+                device=DEVICE,
+                compute_type=COMPUTE_TYPE,
+                cpu_threads=CPU_THREADS,
+                num_workers=NUM_WORKERS,
+            )
+            log_event(
+                "server_profile",
+                device=DEVICE,
+                model=MODEL_NAME,
+                compute=COMPUTE_TYPE,
+                cpu_threads=CPU_THREADS,
+                workers=NUM_WORKERS,
+                hotwords=len([value for value in GLOBAL_HOTWORDS.split(",") if value.strip()]),
+                rapidfuzz=bool(fuzz),
+                protocol=PROTOCOL_VERSION,
+            )
+    return MODEL
+
+
+def resolve_listen_cert_path() -> Path:
+    raw_path = Path(LISTEN_CERT_FILE_RAW)
+    return raw_path if raw_path.is_absolute() else (BASE_DIR / raw_path)
+
+
+def build_websocket_ssl_context() -> Optional[ssl.SSLContext]:
+    if LISTEN_TLS_MODE in {"0", "false", "off", "disabled"}:
+        log_event("ws_tls_disabled", mode=LISTEN_TLS_MODE)
+        return None
+
+    cert_path = resolve_listen_cert_path()
+    if not cert_path.exists():
+        level = "warning" if LISTEN_TLS_MODE in {"auto", ""} else "error"
+        log_event("ws_tls_cert_missing", level=level, path=str(cert_path), mode=LISTEN_TLS_MODE)
+        return None
+
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(certfile=str(cert_path))
+    log_event("ws_tls_enabled", path=str(cert_path), mode=LISTEN_TLS_MODE)
+    return context
+
+
+def preload_model_task() -> None:
+    started = time.perf_counter()
+    log_event("model_preload_started", model=MODEL_NAME)
+    try:
+        ensure_model_loaded()
+        log_event("model_preload_ready", model=MODEL_NAME, ms=int((time.perf_counter() - started) * 1000))
+    except Exception as exc:  # noqa: BLE001
+        log_event("model_preload_failed", level="error", model=MODEL_NAME, error=str(exc))
+
+
+def transcribe_pcm(pcm: np.ndarray, hint_cost: Optional[int] = None) -> str:
+    model = ensure_model_loaded()
+    prompt_text, hotwords_text = build_decode_context(hint_cost)
+    with TRANSCRIBE_LOCK:
+        segments, _ = model.transcribe(
+            pcm,
+            beam_size=1,
+            best_of=1,
+            patience=0.35,
             language="pt",
-            initial_prompt=CLASH_ROYALE_PROMPT,
+            initial_prompt=prompt_text,
             condition_on_previous_text=False,
             temperature=0.0,
-            no_speech_threshold=backend.no_speech_threshold,
-            log_prob_threshold=backend.log_prob_threshold,
-            compression_ratio_threshold=backend.compression_ratio_threshold,
-            vad_filter=True,
-            vad_parameters=backend.vad_parameters,
+            no_speech_threshold=0.36,
+            log_prob_threshold=-1.1,
+            compression_ratio_threshold=2.2,
+            # The browser already segments each utterance, so model-side VAD only adds latency here.
+            vad_filter=False,
             without_timestamps=True,
-            max_new_tokens=backend.max_new_tokens,
-            hotwords=backend.hotwords or None,
+            max_new_tokens=MAX_NEW_TOKENS,
+            hotwords=hotwords_text or None,
         )
-    bruto = re.sub(r"\s+", " ", " ".join(segment.text for segment in segments)).strip()
-    return normalizar_transcricao_clash(bruto)
+    return normalize_transcript(re.sub(r"\s+", " ", " ".join(segment.text for segment in segments)).strip())
 
 
-def processar_audio_bytes(audio_bytes, mime_type, backend):
-    suffix = suffix_for_mime(mime_type)
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_audio:
-        temp_audio.write(audio_bytes)
-        temp_file_name = temp_audio.name
+def decode_chunks_to_pcm(chunks: List[bytes]) -> Optional[np.ndarray]:
+    pcm_parts: List[np.ndarray] = []
+    failed_chunks = 0
+
+    for chunk in chunks:
+        try:
+            pcm_parts.append(decode_audio(io.BytesIO(chunk), sampling_rate=SAMPLE_RATE))
+        except Exception as exc:  # noqa: BLE001
+            failed_chunks += 1
+            log_event(
+                "decode_chunk_failed",
+                level="warning",
+                error=str(exc),
+                blob_bytes=len(chunk),
+            )
+
+    if pcm_parts:
+        if failed_chunks:
+            log_event("decode_chunk_partial_recovery", level="warning", ok=len(pcm_parts), failed=failed_chunks)
+        return np.concatenate(pcm_parts, axis=0)
+
+    joined = b"".join(chunks)
+    if not joined:
+        return None
 
     try:
-        return processar_audio(temp_file_name, backend)
-    finally:
-        if os.path.exists(temp_file_name):
-            os.remove(temp_file_name)
+        log_event("decode_chunk_joined_fallback", level="warning", chunks=len(chunks), bytes=len(joined))
+        return decode_audio(io.BytesIO(joined), sampling_rate=SAMPLE_RATE)
+    except Exception as exc:  # noqa: BLE001
+        log_event("decode_joined_failed", level="error", error=str(exc), bytes=len(joined))
+        return None
 
 
 @dataclass
-class UtteranceState:
+class Utterance:
     utterance_id: str
-    speech_started_at: int = 0
     platform: str = "desktop"
-    mime_type: str = "audio/webm"
-    audio_bytes: bytearray = field(default_factory=bytearray)
-    seq: int = 0
+    speech_started_at: int = 0
     chunk_count: int = 0
-    partial_texts: dict = field(default_factory=dict)
-    partial_tasks: dict = field(default_factory=dict)
-    partial_inflight: set = field(default_factory=set)
-    last_partial_sent_at: dict = field(default_factory=dict)
-    finals_sent: set = field(default_factory=set)
-    created_at_ms: int = 0
-    first_chunk_at_ms: int = 0
-    last_chunk_at_ms: int = 0
     bytes_received: int = 0
-    decode_time_ms: dict = field(default_factory=dict)
+    hint_cost: Optional[int] = None
+    chunks: List[bytes] = field(default_factory=list)
 
 
-def build_server_ready_payload():
+def append_chunk_to_utterance(utterance: Utterance, chunk: bytes, hint_cost: Optional[int] = None) -> None:
+    if not chunk:
+        return
+    if hint_cost is not None:
+        utterance.hint_cost = hint_cost
+    utterance.chunk_count += 1
+    utterance.bytes_received += len(chunk)
+    utterance.chunks.append(chunk)
+
+
+def build_server_ready_payload() -> dict:
     return {
         "type": "server_ready",
         "protocol": PROTOCOL_VERSION,
         "engines": [
             {
-                "engine": backend.engine,
-                "modelName": backend.model_name,
-                "computeType": backend.compute_type,
-                "decodeProfile": backend.decode_profile,
-                "sharedModel": backend.shared_model,
-                "partialEnabled": backend.partial_enabled,
+                "engine": "whisper",
+                "modelName": MODEL_NAME,
+                "computeType": COMPUTE_TYPE,
+                "decodeProfile": "precision",
+                "sharedModel": False,
+                "partialEnabled": False,
             }
-            for backend in ASR_BACKENDS
         ],
         "receivedAt": int(time.time() * 1000),
     }
 
 
-def build_voice_event(utterance, backend, phase, transcript):
+async def send_final(websocket, utterance: Utterance) -> None:
+    started = time.perf_counter()
+
+    def run_decode() -> Tuple[str, Optional[dict]]:
+        pcm = decode_chunks_to_pcm(utterance.chunks)
+        if pcm is None or pcm.size == 0:
+            return "", None
+        raw_text = transcribe_pcm(pcm, utterance.hint_cost)
+        return canonicalize(raw_text, hint_cost=utterance.hint_cost)
+
+    transcript, metadata = await asyncio.to_thread(run_decode)
+    decode_ms = int((time.perf_counter() - started) * 1000)
     received_at = int(time.time() * 1000)
-    latency_ms = None
-    if utterance.speech_started_at:
-        latency_ms = max(0, received_at - utterance.speech_started_at)
-    return {
+    latency_ms = max(0, received_at - utterance.speech_started_at) if utterance.speech_started_at else None
+    confidence = float(metadata["score"]) / 100.0 if metadata and metadata.get("accepted") else None
+
+    payload = {
         "type": "voice_event",
-        "engine": backend.engine,
-        "platform": utterance.platform or "desktop",
+        "engine": "whisper",
+        "platform": utterance.platform,
         "utteranceId": utterance.utterance_id,
-        "phase": phase,
+        "phase": "final",
         "transcript": transcript,
-        "confidence": None,
+        "confidence": confidence,
         "receivedAt": received_at,
         "speechStartedAt": utterance.speech_started_at or received_at,
         "latencyMs": latency_ms,
         "chunkCount": utterance.chunk_count,
-        "modelName": backend.model_name,
-        "computeType": backend.compute_type,
-        "decodeProfile": backend.decode_profile,
-        "sharedModel": backend.shared_model,
+        "bytes": utterance.bytes_received,
+        "modelName": MODEL_NAME,
+        "computeType": COMPUTE_TYPE,
+        "decodeMs": decode_ms,
+        "hintCost": utterance.hint_cost,
     }
+    if metadata:
+        payload["canonical"] = metadata
+
+    log_event(
+        "final_ready",
+        utterance_id=utterance.utterance_id,
+        decode_ms=decode_ms,
+        transcript=transcript,
+        accepted=metadata.get("accepted") if metadata else None,
+        score=metadata.get("score") if metadata else None,
+        hint_cost=utterance.hint_cost,
+    )
+
+    if transcript:
+        await websocket.send(json.dumps(payload, ensure_ascii=False))
 
 
-def build_utterance_summary(utterance, closed_at_ms):
-    started_at = utterance.speech_started_at or utterance.created_at_ms or 0
-    speech_to_close_ms = max(0, closed_at_ms - started_at) if started_at else None
-    capture_window_ms = None
-    if utterance.first_chunk_at_ms and utterance.last_chunk_at_ms:
-        capture_window_ms = max(0, utterance.last_chunk_at_ms - utterance.first_chunk_at_ms)
-    return {
-        "utteranceId": utterance.utterance_id,
-        "platform": utterance.platform,
-        "chunks": utterance.chunk_count,
-        "bytes": utterance.bytes_received or len(utterance.audio_bytes),
-        "speechToCloseMs": speech_to_close_ms,
-        "captureWindowMs": capture_window_ms,
-        "decodeMsByEngine": utterance.decode_time_ms,
-        "partialsByEngine": list(utterance.partial_texts.keys()),
-        "finalsByEngine": list(utterance.finals_sent),
-    }
-
-
-async def emit_voice_event(websocket, utterance, backend, phase, transcript):
-    if not transcript:
-        return
-    payload = build_voice_event(utterance, backend, phase, transcript)
-    await websocket.send(json.dumps(payload, ensure_ascii=False))
-
-
-async def maybe_emit_partial_for_backend(websocket, utterance, backend):
-    if not backend.partial_enabled:
-        return
-    if backend.engine in utterance.finals_sent or backend.engine in utterance.partial_inflight:
-        return
-    if utterance.chunk_count < PARTIAL_MIN_CHUNKS:
-        return
-    if len(utterance.audio_bytes) < PARTIAL_MIN_BYTES:
-        return
-    if (time.monotonic() - utterance.last_partial_sent_at.get(backend.engine, 0.0)) < PARTIAL_MIN_INTERVAL_S:
-        return
-
-    snapshot = bytes(utterance.audio_bytes)
-    mime_type = utterance.mime_type
-    utterance.partial_inflight.add(backend.engine)
-
-    async def run_partial():
-        decode_started = time.perf_counter()
-        try:
-            transcript = await asyncio.to_thread(processar_audio_bytes, snapshot, mime_type, backend)
-            decode_ms = int((time.perf_counter() - decode_started) * 1000)
-            utterance.decode_time_ms[backend.engine] = utterance.decode_time_ms.get(backend.engine, 0) + decode_ms
-            if not transcript:
-                log_event(
-                    "partial_skip_empty",
-                    level="debug",
-                    engine=backend.engine,
-                    utterance_id=utterance.utterance_id,
-                    decode_ms=decode_ms,
-                    chunks=utterance.chunk_count,
-                    bytes=len(snapshot),
-                )
-                return
-            if transcript == utterance.partial_texts.get(backend.engine) or backend.engine in utterance.finals_sent:
-                log_event(
-                    "partial_skip_duplicate",
-                    level="debug",
-                    engine=backend.engine,
-                    utterance_id=utterance.utterance_id,
-                    decode_ms=decode_ms,
-                )
-                return
-            utterance.partial_texts[backend.engine] = transcript
-            utterance.last_partial_sent_at[backend.engine] = time.monotonic()
-            log_event(
-                "partial_sent",
-                engine=backend.engine,
-                utterance_id=utterance.utterance_id,
-                decode_ms=decode_ms,
-                chunks=utterance.chunk_count,
-                bytes=len(snapshot),
-                text=transcript,
-            )
-            await emit_voice_event(websocket, utterance, backend, "partial", transcript)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            log_event(
-                "partial_error",
-                level="warning",
-                engine=backend.engine,
-                utterance_id=utterance.utterance_id,
-                error=str(exc),
-            )
-        finally:
-            utterance.partial_inflight.discard(backend.engine)
-            utterance.partial_tasks.pop(backend.engine, None)
-
-    utterance.partial_tasks[backend.engine] = asyncio.create_task(run_partial())
-
-
-async def maybe_emit_partial(websocket, utterance):
-    for backend in ASR_BACKENDS:
-        await maybe_emit_partial_for_backend(websocket, utterance, backend)
-
-
-async def finalizar_utterance(websocket, utterance):
-    if utterance.finals_sent.issuperset({backend.engine for backend in ASR_BACKENDS}):
-        return
-
-    pending_tasks = [
-        task for task in utterance.partial_tasks.values()
-        if task and not task.done()
-    ]
-    for task in pending_tasks:
-        task.cancel()
-    for task in pending_tasks:
-        with suppress(asyncio.CancelledError):
-            await task
-
-    if not utterance.audio_bytes:
-        log_event(
-            "utterance_skip_empty",
-            utterance_id=utterance.utterance_id,
-            chunks=utterance.chunk_count,
-            platform=utterance.platform,
-        )
-        return
-
-    snapshot = bytes(utterance.audio_bytes)
-
-    async def run_final(backend):
-        if backend.engine in utterance.finals_sent:
-            return
-        utterance.finals_sent.add(backend.engine)
-        decode_started = time.perf_counter()
-        transcript = await asyncio.to_thread(
-            processar_audio_bytes,
-            snapshot,
-            utterance.mime_type,
-            backend,
-        )
-        decode_ms = int((time.perf_counter() - decode_started) * 1000)
-        utterance.decode_time_ms[backend.engine] = utterance.decode_time_ms.get(backend.engine, 0) + decode_ms
-        if transcript:
-            log_event(
-                "final_sent",
-                engine=backend.engine,
-                utterance_id=utterance.utterance_id,
-                decode_ms=decode_ms,
-                chunks=utterance.chunk_count,
-                bytes=len(snapshot),
-                text=transcript,
-            )
-            await emit_voice_event(websocket, utterance, backend, "final", transcript)
-        else:
-            log_event(
-                "final_empty",
-                level="debug",
-                engine=backend.engine,
-                utterance_id=utterance.utterance_id,
-                decode_ms=decode_ms,
-                chunks=utterance.chunk_count,
-                bytes=len(snapshot),
-            )
-
-    await asyncio.gather(*(run_final(backend) for backend in ASR_BACKENDS))
-    closed_at_ms = int(time.time() * 1000)
-    log_event("utterance_closed", **build_utterance_summary(utterance, closed_at_ms))
-
-
-async def recognize_audio(websocket):
+async def recognize_audio(websocket) -> None:
     remote = str(getattr(websocket, "remote_address", "unknown"))
     conn_id = f"ws-{int(time.time() * 1000)}-{id(websocket)}"
     log_event("ws_connected", conn_id=conn_id, remote=remote)
-    utterances = {}
+    utterances: Dict[str, Utterance] = {}
+
     await websocket.send(json.dumps(build_server_ready_payload(), ensure_ascii=False))
-    log_event("server_ready_sent", conn_id=conn_id, engines=[backend.engine for backend in ASR_BACKENDS])
 
     try:
         async for message in websocket:
+            if isinstance(message, (bytes, bytearray)):
+                legacy_utterance = Utterance(
+                    utterance_id=f"legacy-{int(time.time() * 1000)}",
+                    platform="legacy",
+                    speech_started_at=int(time.time() * 1000),
+                    chunk_count=1,
+                    bytes_received=len(message),
+                    chunks=[bytes(message)],
+                )
+                await send_final(websocket, legacy_utterance)
+                continue
+
             if not isinstance(message, str):
-                log_event("ws_skip_non_text_message", level="debug", conn_id=conn_id)
                 continue
 
             try:
                 payload = json.loads(message)
             except json.JSONDecodeError:
-                log_event(
-                    "ws_invalid_json",
-                    level="warning",
-                    conn_id=conn_id,
-                    sample=message[:180],
-                )
+                log_event("ws_invalid_json", level="warning", conn_id=conn_id, sample=message[:180])
                 continue
 
             msg_type = payload.get("type")
@@ -854,12 +996,12 @@ async def recognize_audio(websocket):
                 if not utterance_id:
                     log_event("start_utterance_missing_id", level="warning", conn_id=conn_id)
                     continue
-                now_ms = int(time.time() * 1000)
-                utterances[utterance_id] = UtteranceState(
+                hint_cost = parse_hint_cost(payload.get("hintCost") or payload.get("hint_cost"))
+                utterances[utterance_id] = Utterance(
                     utterance_id=utterance_id,
-                    speech_started_at=int(payload.get("speechStartedAt") or 0),
                     platform=payload.get("platform") or "desktop",
-                    created_at_ms=now_ms,
+                    speech_started_at=int(payload.get("speechStartedAt") or 0),
+                    hint_cost=hint_cost,
                 )
                 log_event(
                     "utterance_started",
@@ -867,6 +1009,7 @@ async def recognize_audio(websocket):
                     utterance_id=utterance_id,
                     platform=utterances[utterance_id].platform,
                     speech_started_at=utterances[utterance_id].speech_started_at,
+                    hint_cost=hint_cost,
                 )
                 continue
 
@@ -874,18 +1017,20 @@ async def recognize_audio(websocket):
                 if not utterance_id:
                     log_event("audio_chunk_missing_id", level="warning", conn_id=conn_id)
                     continue
+
                 utterance = utterances.setdefault(
                     utterance_id,
-                    UtteranceState(
+                    Utterance(
                         utterance_id=utterance_id,
-                        speech_started_at=int(payload.get("speechStartedAt") or 0),
                         platform=payload.get("platform") or "desktop",
-                        created_at_ms=int(time.time() * 1000),
+                        speech_started_at=int(payload.get("speechStartedAt") or 0),
+                        hint_cost=parse_hint_cost(payload.get("hintCost") or payload.get("hint_cost")),
                     ),
                 )
+
                 try:
                     chunk = base64.b64decode(payload.get("audioBase64") or "", validate=False)
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001
                     log_event(
                         "audio_chunk_decode_error",
                         level="warning",
@@ -894,75 +1039,113 @@ async def recognize_audio(websocket):
                         error=str(exc),
                     )
                     chunk = b""
+
                 if not chunk:
+                    continue
+
+                chunk_hint_cost = parse_hint_cost(payload.get("hintCost") or payload.get("hint_cost"))
+                append_chunk_to_utterance(utterance, chunk, hint_cost=chunk_hint_cost)
+                continue
+
+            if msg_type == "audio_chunks":
+                if not utterance_id:
+                    log_event("audio_chunks_missing_id", level="warning", conn_id=conn_id)
+                    continue
+
+                utterance = utterances.setdefault(
+                    utterance_id,
+                    Utterance(
+                        utterance_id=utterance_id,
+                        platform=payload.get("platform") or "desktop",
+                        speech_started_at=int(payload.get("speechStartedAt") or 0),
+                        hint_cost=parse_hint_cost(payload.get("hintCost") or payload.get("hint_cost")),
+                    ),
+                )
+
+                chunk_hint_cost = parse_hint_cost(payload.get("hintCost") or payload.get("hint_cost"))
+                audio_items = payload.get("audio")
+                if not isinstance(audio_items, list):
+                    log_event("audio_chunks_invalid_payload", level="warning", conn_id=conn_id, utterance_id=utterance_id)
+                    continue
+
+                decoded_count = 0
+                for item in audio_items:
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        chunk = base64.b64decode(item.get("audioBase64") or "", validate=False)
+                    except Exception as exc:  # noqa: BLE001
+                        log_event(
+                            "audio_chunks_decode_error",
+                            level="warning",
+                            conn_id=conn_id,
+                            utterance_id=utterance_id,
+                            error=str(exc),
+                        )
+                        continue
+                    if not chunk:
+                        continue
+                    append_chunk_to_utterance(utterance, chunk, hint_cost=chunk_hint_cost)
+                    decoded_count += 1
+
+                if decoded_count == 0:
+                    log_event("audio_chunks_empty", level="warning", conn_id=conn_id, utterance_id=utterance_id)
+                continue
+
+            if msg_type == "utterance_context":
+                if not utterance_id:
+                    log_event("utterance_context_missing_id", level="warning", conn_id=conn_id)
+                    continue
+                utterance = utterances.get(utterance_id)
+                if not utterance:
                     log_event(
-                        "audio_chunk_empty",
+                        "utterance_context_missing_state",
                         level="debug",
                         conn_id=conn_id,
                         utterance_id=utterance_id,
                     )
                     continue
-                utterance.mime_type = payload.get("mimeType") or utterance.mime_type
-                utterance.seq = max(utterance.seq, int(payload.get("seq") or 0))
-                utterance.chunk_count += 1
-                utterance.audio_bytes.extend(chunk)
-                chunk_now_ms = int(time.time() * 1000)
-                utterance.bytes_received += len(chunk)
-                if not utterance.first_chunk_at_ms:
-                    utterance.first_chunk_at_ms = chunk_now_ms
-                utterance.last_chunk_at_ms = chunk_now_ms
-                if utterance.chunk_count == 1 or utterance.chunk_count % 20 == 0:
-                    log_event(
-                        "audio_chunk_progress",
-                        level="debug",
-                        conn_id=conn_id,
-                        utterance_id=utterance_id,
-                        chunks=utterance.chunk_count,
-                        bytes=utterance.bytes_received,
-                        seq=utterance.seq,
-                        mime=utterance.mime_type,
-                    )
-                await maybe_emit_partial(websocket, utterance)
+                hint_cost = parse_hint_cost(payload.get("hintCost") or payload.get("hint_cost"))
+                if hint_cost is not None:
+                    utterance.hint_cost = hint_cost
+                log_event(
+                    "utterance_context_updated",
+                    level="debug",
+                    conn_id=conn_id,
+                    utterance_id=utterance_id,
+                    hint_cost=utterance.hint_cost,
+                    source=payload.get("source") or "frontend",
+                )
                 continue
 
             if msg_type == "end_utterance":
                 if not utterance_id:
                     log_event("end_utterance_missing_id", level="warning", conn_id=conn_id)
                     continue
-                utterance = utterances.get(utterance_id)
+                utterance = utterances.pop(utterance_id, None)
                 if not utterance:
-                    log_event(
-                        "end_utterance_missing_state",
-                        level="warning",
-                        conn_id=conn_id,
-                        utterance_id=utterance_id,
-                    )
+                    log_event("end_utterance_missing_state", level="warning", conn_id=conn_id, utterance_id=utterance_id)
                     continue
-                await finalizar_utterance(websocket, utterance)
-                utterances.pop(utterance_id, None)
+                await send_final(websocket, utterance)
                 continue
 
             if msg_type:
                 log_event("ws_message_unhandled", level="debug", conn_id=conn_id, type=msg_type)
     except websockets.exceptions.ConnectionClosed:
         log_event("ws_closed", conn_id=conn_id, remote=remote)
-    except Exception as exc:  # noqa: BLE001
-        log_event("ws_loop_error", level="error", conn_id=conn_id, error=str(exc))
-        raise
     finally:
-        for utterance in utterances.values():
-            for task in utterance.partial_tasks.values():
-                if task and not task.done():
-                    task.cancel()
         log_event("ws_cleanup_done", conn_id=conn_id, pending_utterances=len(utterances))
 
 
-async def main():
-    host = os.getenv("CR_LISTEN_HOST", "localhost")
+async def main() -> None:
+    host = os.getenv("CR_LISTEN_HOST", "127.0.0.1")
     port = env_int("CR_LISTEN_PORT", 8765, min_value=1, max_value=65535)
-    log_event("ws_server_starting", host=host, port=port)
-    async with websockets.serve(recognize_audio, host, port, ping_interval=None):
-        log_event("ws_server_ready", host=host, port=port)
+    ssl_context = build_websocket_ssl_context()
+    log_event("ws_server_starting", host=host, port=port, transport="wss" if ssl_context else "ws")
+    async with websockets.serve(recognize_audio, host, port, ping_interval=None, ssl=ssl_context):
+        log_event("ws_server_ready", host=host, port=port, transport="wss" if ssl_context else "ws")
+        if PRELOAD_MODEL_ON_BOOT:
+            asyncio.create_task(asyncio.to_thread(preload_model_task))
         await asyncio.Future()
 
 

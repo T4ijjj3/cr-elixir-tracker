@@ -1,0 +1,22 @@
+                <button class="btn-voice" id="btnVoice" title="Ativar voz">
+                    <span class="btn-icon">🎤</span> VOZ
+                </button>
+            </section>
+
+            <section class="voice-status" id="voiceStatus" style="display:none;">
+                <div class="voice-status-head">
+                    <span class="voice-dot" id="voiceDot"></span>
+                    <span class="voice-status-text" id="voiceStatusText">Voz inativa</span>
+                </div>
+                <div class="voice-transcript" id="voiceTranscript"></div>
+            </section>
+            <section class="voice-log-panel" id="voiceLogPanel" style="display:none;">
+                <div class="voice-log-head">
+                    <span class="voice-log-title">Relatório Técnico</span>
+                    <div class="voice-log-actions">
+                        <button class="voice-log-btn" id="btnCopyVoiceLog" type="button">Copiar</button>
+                        <button class="voice-log-btn secondary" id="btnClearVoiceLog" type="button">Limpar</button>
+                    </div>
+                </div>
+                <textarea class="voice-log-output" id="voiceLogOutput" readonly placeholder="Ative a voz para gerar histórico técnico copiável."></textarea>
+            </section>

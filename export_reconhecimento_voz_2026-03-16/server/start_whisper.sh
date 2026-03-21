@@ -20,37 +20,6 @@ log() {
     echo "$(timestamp) | $*"
 }
 
-python_modules_ready() {
-    python - <<'PY'
-import importlib.util
-import sys
-
-required = ["faster_whisper", "websockets", "numpy", "torch"]
-missing = [name for name in required if importlib.util.find_spec(name) is None]
-optional_missing = [name for name in ["rapidfuzz"] if importlib.util.find_spec(name) is None]
-
-if optional_missing:
-    print("optional_missing=" + ",".join(optional_missing))
-
-if missing:
-    print("missing=" + ",".join(missing))
-    raise SystemExit(1)
-
-raise SystemExit(0)
-PY
-}
-
-python_module_exists() {
-    local module_name="$1"
-    python - "$module_name" <<'PY'
-import importlib.util
-import sys
-
-module_name = sys.argv[1]
-raise SystemExit(0 if importlib.util.find_spec(module_name) else 1)
-PY
-}
-
 is_port_open() {
     local host="$1"
     local port="$2"
@@ -126,8 +95,8 @@ else
 fi
 
 if ! command -v ffmpeg >/dev/null 2>&1; then
-    log "ℹ️ FFmpeg não encontrado no PATH."
-    log "ℹ️ O listen_server usa PyAV via faster-whisper, então o binário do sistema não é obrigatório."
+    log "⚠️ FFmpeg não encontrado. Tentando instalar..."
+    sudo apt update && sudo apt install -y ffmpeg
 fi
 
 if [ ! -d "venv" ]; then
@@ -138,25 +107,16 @@ fi
 log "🔄 Ativando ambiente virtual..."
 source venv/bin/activate
 
-export PIP_DISABLE_PIP_VERSION_CHECK=1
-export CR_WHISPER_MAX_NEW_TOKENS="${CR_WHISPER_MAX_NEW_TOKENS:-10}"
-export CR_WHISPER_HOTWORD_LIMIT="${CR_WHISPER_HOTWORD_LIMIT:-160}"
-export CR_WHISPER_HOTWORDS_PER_CARD="${CR_WHISPER_HOTWORDS_PER_CARD:-2}"
+export CR_WHISPER_MAX_NEW_TOKENS="${CR_WHISPER_MAX_NEW_TOKENS:-18}"
+export CR_WHISPER_HOTWORD_LIMIT="${CR_WHISPER_HOTWORD_LIMIT:-96}"
 export CR_LOW_LATENCY_MODE="${CR_LOW_LATENCY_MODE:-1}"
 export CR_WHISPER_ALT_ENABLED="${CR_WHISPER_ALT_ENABLED:-0}"
 export CR_WHISPER_TARGET_RAM_GB="${CR_WHISPER_TARGET_RAM_GB:-16}"
 export CR_WHISPER_COMPUTE_TYPE="${CR_WHISPER_COMPUTE_TYPE:-int8}"
 export CR_LISTEN_LOG_FILE="${CR_LISTEN_LOG_FILE:-$LOG_DIR/listen_server.log}"
 export CR_HTTPS_LOG_FILE="${CR_HTTPS_LOG_FILE:-$LOG_DIR/https_server.log}"
-export CR_LISTEN_HOST="${CR_LISTEN_HOST:-127.0.0.1}"
-export CR_LISTEN_TLS="${CR_LISTEN_TLS:-auto}"
-export CR_LISTEN_CERT="${CR_LISTEN_CERT:-server.pem}"
-export CR_WHISPER_PRELOAD_MODEL="${CR_WHISPER_PRELOAD_MODEL:-1}"
 
 CPU_THREADS_DEFAULT="$(nproc 2>/dev/null || echo 4)"
-if [ "${CR_LOW_LATENCY_MODE}" = "1" ] && [ "$CPU_THREADS_DEFAULT" -gt 6 ]; then
-    CPU_THREADS_DEFAULT=6
-fi
 if [ -z "${CR_WHISPER_CPU_THREADS:-}" ]; then
     export CR_WHISPER_CPU_THREADS="$CPU_THREADS_DEFAULT"
 fi
@@ -176,13 +136,7 @@ if [ -z "${CR_WHISPER_PTBR_MODEL:-}" ]; then
 fi
 
 if [ -z "${CR_WHISPER_MODEL:-}" ]; then
-    if [ "${CR_LOW_LATENCY_MODE}" = "1" ]; then
-        export CR_WHISPER_MODEL="small"
-        if [ -n "${CR_WHISPER_PTBR_MODEL:-}" ]; then
-            log "⚡ Modo baixa latência ativo: usando Whisper small por padrão."
-            log "ℹ️ Modelo PT-BR local disponível em ${CR_WHISPER_PTBR_MODEL} para quando você quiser priorizar precisão."
-        fi
-    elif [ -n "${CR_WHISPER_PTBR_MODEL:-}" ]; then
+    if [ -n "${CR_WHISPER_PTBR_MODEL:-}" ]; then
         export CR_WHISPER_MODEL="$CR_WHISPER_PTBR_MODEL"
     else
         export CR_WHISPER_MODEL="small"
@@ -195,23 +149,12 @@ log "🧵 Threads CPU Whisper: ${CR_WHISPER_CPU_THREADS}"
 log "📄 listen_server.log: ${CR_LISTEN_LOG_FILE}"
 log "📄 https_server.log: ${CR_HTTPS_LOG_FILE}"
 
-log "🧪 Verificando dependências Python essenciais..."
-if python_modules_ready; then
-    log "✅ Dependências principais já estão instaladas. Pulando pip install para subir mais rápido."
-else
-    log "⬇️  Dependências ausentes detectadas. Instalando apenas o necessário..."
-    pip install faster-whisper websockets torch typing-extensions rapidfuzz
-fi
-
-if ! python_module_exists "rapidfuzz"; then
-    log "⬇️  rapidfuzz não encontrado. Instalando para matching fonético mais rápido..."
-    if ! pip install rapidfuzz; then
-        log "⚠️ Falha ao instalar rapidfuzz (seguindo com fallback em difflib)."
-    fi
-fi
+log "⬇️  Instalando/atualizando dependências Python..."
+pip install --upgrade pip
+pip install faster-whisper websockets torch typing-extensions
 
 diagnose_ports
-log "🚀 Iniciando servidor de voz (${CR_LISTEN_TLS:+TLS ${CR_LISTEN_TLS}} em localhost:8765)..."
+log "🚀 Iniciando servidor de voz (WebSocket em localhost:8765)..."
 log "🖥️  Abra: https://localhost:8443"
 log "🔎 Para diagnóstico completo: ./diagnose_localhost.sh"
 python listen_server.py

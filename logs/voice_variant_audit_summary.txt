@@ -1,0 +1,133 @@
+total_cards=125
+min_card=Canhoneiro
+min_count=32
+max_card=Aríete de Batalha
+max_count=125
+below_30_count=0
+
+card_counts:
+Arbusto Traiçoeiro: 32
+Arqueiras: 32
+Arqueiro Mágico: 32
+Aríete de Batalha: 125
+Balão: 32
+Bandida: 32
+Bandida Líder: 32
+Barril de Bárbaro: 32
+Barril de Esqueletos: 32
+Barril de Goblins: 32
+Bebê Dragão: 32
+Berserker: 32
+Bola de Fogo: 32
+Bola de Neve: 32
+Bombardeiro: 32
+Bruxa: 32
+Bruxa Mãe: 32
+Bruxa Sombria: 32
+Bárbaros: 32
+Bárbaros de Elite: 32
+Cabana de Bárbaros: 32
+Cabana de Goblins: 32
+Canhoneiro: 32
+Canhão: 32
+Carrinho de Canhão: 32
+Cavaleiro: 32
+Cavaleiro Dourado: 32
+Caçador: 32
+Cemitério: 32
+Clone: 32
+Coletor de Elixir: 32
+Corredor: 32
+Cozinheiro Real: 32
+Curadora Guerreira: 32
+Destruidores de Muros: 32
+Domadora de Carneiro: 32
+Dragão Elétrico: 32
+Dragão Infernal: 32
+Dragões Esqueleto: 32
+Duquesa das Adagas: 32
+Eletrocutadores: 32
+Encomenda Real: 32
+Escavadeira de Goblins: 32
+Espelho: 32
+Espírito Curador: 32
+Espírito de Gelo: 32
+Espírito Elétrico: 32
+Espíritos de Fogo: 32
+Esqueleto Gigante: 32
+Esqueletos: 32
+Executor: 32
+Exército de Esqueletos: 32
+Fantasma Real: 32
+Flechas: 32
+Foguete: 32
+Fornalha: 32
+Fênix: 32
+Fúria: 32
+Gangue de Goblins: 32
+Gelo: 32
+Gigante: 32
+Gigante das Runas: 32
+Gigante Elétrico: 32
+Gigante Real: 32
+Goblin com Dardos: 32
+Goblin Demolidor: 32
+Goblin Gigante: 32
+Goblins: 32
+Goblins Lanceiros: 32
+Goblinstein: 32
+Golem: 32
+Golem de Elixir: 32
+Golem de Gelo: 32
+Guardas: 32
+Horda de Servos: 32
+Imperatriz Espiritual: 32
+Jaula de Goblin: 32
+Lançador: 32
+Lava Hound: 32
+Lenhador: 32
+Lápide: 32
+Mago: 32
+Mago de Gelo: 32
+Mago Elétrico: 32
+Maldição Goblin: 32
+Megacavaleiro: 32
+Megasservo: 32
+Mineiro: 32
+Mineiro Bombado: 32
+Mini PEKKA: 34
+Monge: 32
+Morcegos: 32
+Morteiro: 32
+Mosqueteira: 32
+Máquina Goblin: 32
+Máquina Voadora: 32
+O Tronco: 32
+P.E.K.K.A: 35
+Patifes: 32
+Pequeno Príncipe: 32
+Pescador: 32
+Pirotécnica: 37
+Porcos Reais: 32
+Princesa: 32
+Princesa da Torre: 32
+Príncipe: 32
+Príncipe das Trevas: 32
+Rainha Arqueira: 32
+Recrutas Reais: 32
+Rei Esqueleto: 32
+Relâmpago: 32
+Servos: 32
+Sparky: 32
+Terremoto: 32
+Tesla: 32
+Tornado: 32
+Torre de Bombas: 32
+Torre Inferno: 32
+Três Mosqueteiras: 36
+Valquíria: 32
+Veneno: 32
+Vinhas: 32
+Vácuo: 32
+x-Besta: 35
+Zap: 32

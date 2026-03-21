@@ -14,11 +14,11 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;700;900&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="style_v2.css?v=96">
+    <link rel="stylesheet" href="style_v2.css?v=97">
 </head>
 
 <body>
-    <div id="version" style="position:fixed;top:0;right:0;background:red;color:white;z-index:9999;font-size:12px;padding:2px;">v96</div>
+    <div id="version" style="position:fixed;top:0;right:0;background:red;color:white;z-index:9999;font-size:12px;padding:2px;">v97</div>
     
     
     <!-- Feedback de vulnerabilidade (laterais) -->
@@ -112,6 +112,41 @@
                     </div>
                 </div>
                 <textarea class="voice-log-output" id="voiceLogOutput" readonly placeholder="Ative a voz para gerar histórico técnico copiável."></textarea>
+            </section>
+            <section class="voice-log-panel" id="voiceTrainingPanel" style="display:none;">
+                <div class="voice-log-head">
+                    <span class="voice-log-title">Treinamento de Voz</span>
+                    <div class="voice-log-actions">
+                        <button class="voice-log-btn" id="btnVoiceTrainingToggle" type="button">Iniciar treino</button>
+                        <button class="voice-log-btn secondary" id="btnVoiceTrainingSave" type="button">Salvar banco</button>
+                    </div>
+                </div>
+                <div class="voice-training-body">
+                    <div class="voice-training-prompt" id="voiceTrainingPrompt">Treino inativo.</div>
+                    <div class="voice-training-card" id="voiceTrainingCardPreview">
+                        <div class="voice-training-card-art-wrap">
+                            <img id="voiceTrainingCardImage" class="voice-training-card-art" alt="" style="display:none;">
+                        </div>
+                        <div class="voice-training-card-meta">
+                            <div class="voice-training-card-name" id="voiceTrainingCardName">Carta: -</div>
+                            <div class="voice-training-card-cost" id="voiceTrainingCardCost">Custo: -</div>
+                        </div>
+                    </div>
+                    <div class="voice-training-row">
+                        <label for="voiceTrainingCardSelect">Carta real:</label>
+                        <select id="voiceTrainingCardSelect" class="voice-training-select"></select>
+                    </div>
+                    <div class="voice-training-row">
+                        <button class="voice-log-btn" id="btnVoiceTrainingMark" type="button">Marcar amostra</button>
+                        <button class="voice-log-btn secondary" id="btnVoiceTrainingNext" type="button">Próxima carta</button>
+                    </div>
+                    <div class="voice-training-row">
+                        <button class="voice-log-btn" id="btnVoiceTrainingTestToggle" type="button">Iniciar teste por carta</button>
+                        <button class="voice-log-btn secondary" id="btnVoiceTrainingTestNext" type="button">Próxima carta (teste)</button>
+                    </div>
+                    <textarea class="voice-log-output" id="voiceTrainingLastTranscript" readonly placeholder="Último transcript final capturado no treino."></textarea>
+                    <textarea class="voice-log-output" id="voiceTrainingTestOutput" readonly placeholder="Resultado dos testes individuais por carta."></textarea>
+                </div>
             </section>
 
             <!-- Cycle -->
@@ -215,33 +250,7 @@
     </footer>
 
     <script src="cards_db.js?v=6"></script>
-    <script src="app_v2.js?v=96"></script>
-    <script>
-        if ('serviceWorker' in navigator) {
-            navigator.serviceWorker.register('sw.js').then((reg) => {
-                reg.update();
-
-                if (reg.waiting) {
-                    reg.waiting.postMessage({ type: 'SKIP_WAITING' });
-                }
-
-                reg.addEventListener('updatefound', () => {
-                    const next = reg.installing;
-                    if (!next) return;
-                    next.addEventListener('statechange', () => {
-                        if (next.state === 'installed' && navigator.serviceWorker.controller) {
-                            next.postMessage({ type: 'SKIP_WAITING' });
-                        }
-                    });
-                });
-            }).catch(() => {});
-
-            navigator.serviceWorker.addEventListener('controllerchange', () => {
-                window.location.reload();
-            });
-        }
-    </script>
-    <script src="install-sw.js"></script>
+    <script src="app_v2.js?v=97"></script>
 </body>
 
 </html>

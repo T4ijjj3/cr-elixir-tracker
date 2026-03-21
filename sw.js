@@ -1,8 +1,8 @@
-const CACHE_NAME = 'cr-elixir-v96';
+const CACHE_NAME = 'cr-elixir-v97';
 const ASSETS = [
   './index.html',
-  './style_v2.css?v=96',
-  './app_v2.js?v=96',
+  './style_v2.css?v=97',
+  './app_v2.js?v=97',
   './manifest.json'
 ];
 
